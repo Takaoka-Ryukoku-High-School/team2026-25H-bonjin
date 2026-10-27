@@ -206,11 +206,14 @@ def main(page: ft.Page, require_login=False):
                 fail("この操作を行う権限がありません。")
                 return
             try:
-                store.delete_item(
-                    collection,
-                    item_id,
-                    owner_id=user["id"] if collection == "tasks" else None,
-                )
+                if collection == "timetable_exceptions":
+                    store.delete_timetable_exception(item_id)
+                else:
+                    store.delete_item(
+                        collection,
+                        item_id,
+                        owner_id=user["id"] if collection == "tasks" else None,
+                    )
             except (OSError, sqlite3.Error) as error:
                 fail(f"削除できませんでした: {error}")
                 return
@@ -352,27 +355,241 @@ def main(page: ft.Page, require_login=False):
             )
 
         def home_view():
-            weekday = WEEKDAY_OPTIONS[datetime.now().weekday() % len(WEEKDAY_OPTIONS)]
-            classes = [item for item in store.list_items("timetable")
-                       if item.get("day") == weekday]
+            today = datetime.now().date()
+            exception = next(
+                (item for item in store.list_timetable_exceptions()
+                 if item["date"] == today.isoformat()),
+                None,
+            )
+            if exception:
+                weekday = today.strftime("%Y-%m-%d")
+                if exception["kind"] == "holiday":
+                    class_rows = [ft.Text(exception["title"], color=MUTED, size=13)]
+                else:
+                    class_rows = [
+                        row("timetable", item, f"{item['period']}時限  {item['time']}",
+                            f"{item['subject']} ・ {item.get('teacher') or '担当未設定'}")
+                        for item in exception["lessons"]
+                    ] or [ft.Text("特別日課の授業は登録されていません。", color=MUTED, size=13)]
+            else:
+                weekday_index = today.weekday()
+                weekday = WEEKDAY_OPTIONS[weekday_index] if weekday_index < len(WEEKDAY_OPTIONS) else None
+                classes = [item for item in store.list_items("timetable")
+                           if weekday and item.get("day") == weekday]
+                classes.sort(key=lambda item: (
+                    not item.get("period", "").isdigit(),
+                    int(item["period"]) if item.get("period", "").isdigit()
+                    else item.get("period", ""),
+                ))
+                class_rows = [
+                    row("timetable", item, f"{item.get('period', '')}時限  {item['time']}",
+                        f"{item['subject']} ・ {item.get('teacher') or '担当未設定'}")
+                    for item in classes
+                ]
+                weekday = f"{weekday}曜日" if weekday else "土・日曜日"
+                if not class_rows:
+                    class_rows = [ft.Text("今日の時間割は登録されていません。",
+                                          color=MUTED, size=13)]
             tests = sorted(store.list_items("tests"), key=lambda item: item.get("date", ""))[:5]
-            class_rows = [row("timetable", item, f"{item['time']}  {item['subject']}",
-                               f"{item['day']}曜日") for item in classes]
             test_rows = [row("tests", item, f"{item['date']}  {item['subject']}",
                              item.get("detail", "")) for item in tests]
+            schedule_subtitle = (
+                f"{weekday}の特別日課" if exception and exception["kind"] == "schedule"
+                else f"{weekday}の休校・授業なし" if exception
+                else f"{weekday}の授業"
+            )
             return ft.Column([
-                panel("今日の時間割", f"{weekday}曜日の授業", [
-                    ft.Column(class_rows or [ft.Text("今日の時間割は登録されていません。",
-                                                     color=MUTED, size=13)], spacing=0)]),
+                panel("今日の時間割", schedule_subtitle, [
+                    ft.Column(class_rows, spacing=0)]),
                 panel("テスト予定", "試験日が近い順に表示しています", [
                     ft.Column(test_rows or [ft.Text("テスト予定は登録されていません。",
                                                     color=MUTED, size=13)], spacing=0)]),
             ], spacing=14)
 
         def timetable_view():
-            return items_panel(
-                "timetable", "時間割登録", "授業の曜日・時間・科目をまとめて管理します。",
-            )
+            can_edit = user["role"] == "teacher"
+            controls = []
+            if can_edit:
+                day = ft.Dropdown(
+                    label="曜日",
+                    options=[ft.dropdown.Option(value) for value in WEEKDAY_OPTIONS],
+                    width=110,
+                )
+                period = text_field("時限", "例 1", expand=False, width=80)
+                time = text_field("時間", "例 09:00-10:30")
+                subject = text_field("授業内容・科目", "例 数学")
+                teacher = text_field("担当教師", "例 山田先生")
+
+                def save_weekday_lesson(e):
+                    if not day.value or not period.value or not period.value.strip() \
+                            or not time.value or not time.value.strip() \
+                            or not subject.value or not subject.value.strip():
+                        fail("曜日・時限・時間・授業内容を入力してください。")
+                        return
+                    payload = {
+                        "day": day.value,
+                        "period": period.value.strip(),
+                        "time": time.value.strip(),
+                        "subject": subject.value.strip(),
+                        "teacher": (teacher.value or "").strip(),
+                    }
+                    try:
+                        existing = next(
+                            (item for item in store.list_items("timetable")
+                             if item.get("day") == payload["day"]
+                             and item.get("period") == payload["period"]),
+                            None,
+                        )
+                        if existing:
+                            store.update_item("timetable", existing["id"], payload)
+                        else:
+                            store.add_item("timetable", payload)
+                    except (OSError, sqlite3.Error, ValueError) as error:
+                        fail(f"時間割を保存できませんでした: {error}")
+                        return
+                    render_all("通常時間割を登録・更新しました")
+
+                controls.append(panel("通常時間割", "同じ曜日・時限を再登録すると、その授業内容・担当教師に更新します。", [
+                    form([day, period, time, subject, teacher], "登録・更新", save_weekday_lesson),
+                ]))
+
+            weekly_lessons = store.list_items("timetable")
+            weekly_lessons.sort(key=lambda item: (
+                WEEKDAY_OPTIONS.index(item["day"]) if item.get("day") in WEEKDAY_OPTIONS else 99,
+                not item.get("period", "").isdigit(),
+                int(item["period"]) if item.get("period", "").isdigit()
+                else item.get("period", ""),
+            ))
+            weekly_rows = [
+                row("timetable", item,
+                    f"{item.get('day', '')}曜日  {item.get('period', '')}時限  {item['time']}",
+                    f"{item['subject']} ・ {item.get('teacher') or '担当未設定'}",
+                    editable=can_edit,
+                )
+                for item in weekly_lessons
+            ]
+            controls.append(panel("曜日ごとの通常時間割", "全クラス共通の通常授業です。", [
+                ft.Column(weekly_rows or [
+                    ft.Text("通常時間割はまだ登録されていません。", color=MUTED, size=13)
+                ], spacing=0),
+            ]))
+
+            exceptions = store.list_timetable_exceptions()
+            if can_edit:
+                exception_date = text_field("日付", "YYYY-MM-DD")
+                kind = ft.Dropdown(
+                    label="日課の種類",
+                    options=[
+                        ft.dropdown.Option("schedule", "特別日課"),
+                        ft.dropdown.Option("holiday", "休校・授業なし"),
+                    ],
+                    value="schedule",
+                    width=170,
+                )
+                exception_title = text_field("日課の内容・理由", "例 短縮授業、文化祭")
+                exception_period = text_field("時限", "例 1", expand=False, width=80)
+                exception_time = text_field("時間", "例 09:00-09:40")
+                exception_subject = text_field("授業内容・科目", "例 数学")
+                exception_teacher = text_field("担当教師", "例 山田先生")
+
+                def set_exception_fields(e):
+                    is_holiday = kind.value == "holiday"
+                    for control in (exception_period, exception_time,
+                                    exception_subject, exception_teacher):
+                        control.disabled = is_holiday
+                    page.update()
+
+                kind.on_select = set_exception_fields
+
+                def save_exception_lesson(e):
+                    selected_date = (exception_date.value or "").strip()
+                    if not selected_date:
+                        fail("日付を入力してください。")
+                        return
+                    if kind.value == "schedule" and (
+                        not exception_period.value or not exception_period.value.strip()
+                        or not exception_time.value or not exception_time.value.strip()
+                        or not exception_subject.value or not exception_subject.value.strip()
+                    ):
+                        fail("特別日課は時限・時間・授業内容を入力してください。")
+                        return
+                    try:
+                        lesson = None
+                        if kind.value == "schedule":
+                            lesson = {
+                                "period": exception_period.value.strip(),
+                                "time": exception_time.value.strip(),
+                                "subject": exception_subject.value.strip(),
+                                "teacher": (exception_teacher.value or "").strip(),
+                            }
+                        store.save_timetable_exception(
+                            selected_date,
+                            kind.value,
+                            exception_title.value or "",
+                            lesson=lesson,
+                        )
+                    except ValueError as error:
+                        fail(str(error))
+                        return
+                    except (OSError, sqlite3.Error) as error:
+                        fail(f"特別日課を保存できませんでした: {error}")
+                        return
+                    render_all("特別日課を登録・更新しました")
+
+                def save_exception_day(e):
+                    try:
+                        store.save_timetable_exception(
+                            (exception_date.value or "").strip(),
+                            kind.value,
+                            exception_title.value or "",
+                        )
+                    except ValueError as error:
+                        fail(str(error))
+                        return
+                    except (OSError, sqlite3.Error) as error:
+                        fail(f"日課を保存できませんでした: {error}")
+                        return
+                    render_all(
+                        "休校・授業なしを登録しました"
+                        if kind.value == "holiday" else "特別日を設定しました"
+                    )
+
+                controls.append(panel(
+                    "日付指定の特別日課・休校",
+                    "特別日を登録すると、その日は通常時間割の代わりにこの日課を表示します。同じ日付・時限を再登録すると授業を更新し、別の時限を登録すると授業を追加します。",
+                    [
+                        form([exception_date, kind, exception_title],
+                             "日付・日課設定を保存", save_exception_day),
+                        form([exception_period, exception_time, exception_subject,
+                              exception_teacher], "授業を登録・更新", save_exception_lesson),
+                    ],
+                ))
+
+            exception_rows = []
+            for exception in exceptions:
+                if exception["kind"] == "holiday":
+                    detail = exception["title"]
+                    summary = "休校・授業なし"
+                else:
+                    summary = f"特別日課: {exception['title']}" if exception["title"] else "特別日課"
+                    detail = " / ".join(
+                        f"{lesson['period']}時限 {lesson['time']} {lesson['subject']} "
+                        f"({lesson.get('teacher') or '担当未設定'})"
+                        for lesson in exception["lessons"]
+                    ) or "授業の登録なし"
+                exception_rows.append(row(
+                    "timetable_exceptions",
+                    {"id": exception["date"]},
+                    f"{exception['date']}  {summary}",
+                    detail,
+                    editable=can_edit,
+                ))
+            controls.append(panel("登録済みの特別日課・休校", "登録した日付は通常時間割より優先されます。", [
+                ft.Column(exception_rows or [
+                    ft.Text("特別日課・休校はまだ登録されていません。", color=MUTED, size=13)
+                ], spacing=0),
+            ]))
+            return ft.Column(controls, spacing=14)
 
         def reminders_view():
             return items_panel(

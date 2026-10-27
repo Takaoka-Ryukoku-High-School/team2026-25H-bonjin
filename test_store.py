@@ -43,6 +43,55 @@ class StoreTests(unittest.TestCase):
                          ["second task"])
         self.assertEqual(len(self.store.list_items("timetable")), 1)
 
+    def test_weekday_timetable_can_be_updated_by_day_and_period(self):
+        lesson = {"day": "月", "period": "1", "time": "09:00-10:30",
+                  "subject": "数学", "teacher": "山田先生"}
+        item_id = self.store.add_item("timetable", lesson)
+        lesson["subject"] = "英語"
+        lesson["teacher"] = "佐藤先生"
+        self.store.update_item("timetable", item_id, lesson)
+
+        saved = self.store.list_items("timetable")
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["subject"], "英語")
+        self.assertEqual(saved[0]["teacher"], "佐藤先生")
+
+    def test_date_override_replaces_weekly_schedule_and_upserts_periods(self):
+        self.store.add_item("timetable", {
+            "day": "月", "period": "1", "time": "09:00-10:30",
+            "subject": "通常授業", "teacher": "通常の先生",
+        })
+        self.store.save_timetable_exception("2026-10-26", "schedule", "短縮授業")
+        self.store.save_timetable_exception("2026-10-26", "schedule", "短縮授業", {
+            "period": "1", "time": "09:00-09:35", "subject": "数学", "teacher": "山田先生",
+        })
+        self.store.save_timetable_exception("2026-10-26", "schedule", "短縮授業", {
+            "period": "2", "time": "09:40-10:15", "subject": "英語", "teacher": "佐藤先生",
+        })
+        self.store.save_timetable_exception("2026-10-26", "schedule", "短縮授業", {
+            "period": "1", "time": "09:00-09:30", "subject": "国語", "teacher": "鈴木先生",
+        })
+
+        exceptions = self.store.list_timetable_exceptions()
+        self.assertEqual(len(exceptions), 1)
+        self.assertEqual([lesson["period"] for lesson in exceptions[0]["lessons"]], ["1", "2"])
+        self.assertEqual(exceptions[0]["lessons"][0]["subject"], "国語")
+        self.assertEqual(exceptions[0]["lessons"][0]["teacher"], "鈴木先生")
+
+        self.store.save_timetable_exception("2026-10-26", "holiday", "文化祭")
+        holiday = self.store.list_timetable_exceptions()[0]
+        self.assertEqual(holiday["kind"], "holiday")
+        self.assertEqual(holiday["title"], "文化祭")
+        self.assertEqual(holiday["lessons"], [])
+        self.store.delete_timetable_exception("2026-10-26")
+        self.assertEqual(self.store.list_timetable_exceptions(), [])
+
+    def test_timetable_exception_requires_iso_date_and_holiday_note(self):
+        with self.assertRaises(ValueError):
+            self.store.save_timetable_exception("2026/10/26", "schedule", "")
+        with self.assertRaises(ValueError):
+            self.store.save_timetable_exception("2026-10-26", "holiday", "")
+
     def test_chat_membership_is_limited_to_teacher_student_and_class(self):
         teacher_id = self.store.create_user("teacher", "password-1", "teacher")
         other_teacher_id = self.store.create_user("other-teacher", "password-2", "teacher")

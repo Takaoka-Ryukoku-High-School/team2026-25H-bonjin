@@ -53,6 +53,10 @@ class Store:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS timetable_exceptions (
+                    date TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL
+                );
                 """
             )
         os.chmod(self.path, 0o600)
@@ -230,12 +234,81 @@ class Store:
                 )
 
     def update_item(self, collection, item_id, payload, owner_id=None):
-        if collection != "tasks":
+        if collection == "tasks":
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE items SET payload = ? WHERE id = ? AND collection = ? AND owner_id = ?",
+                    (json.dumps(payload, ensure_ascii=False), item_id, collection, owner_id),
+                )
+            return
+        if collection not in PUBLIC_COLLECTIONS:
             raise ValueError("このデータは更新できません。")
         with self._connect() as connection:
             connection.execute(
-                "UPDATE items SET payload = ? WHERE id = ? AND collection = ? AND owner_id = ?",
-                (json.dumps(payload, ensure_ascii=False), item_id, collection, owner_id),
+                "UPDATE items SET payload = ? WHERE id = ? AND collection = ?",
+                (json.dumps(payload, ensure_ascii=False), item_id, collection),
+            )
+
+    def list_timetable_exceptions(self):
+        with self._connect() as connection:
+            return [
+                {"date": row["date"], **json.loads(row["payload"])}
+                for row in connection.execute(
+                    "SELECT date, payload FROM timetable_exceptions ORDER BY date"
+                )
+            ]
+
+    def save_timetable_exception(self, exception_date, kind, title, lesson=None):
+        try:
+            datetime.strptime(exception_date, "%Y-%m-%d")
+        except ValueError as error:
+            raise ValueError("日付は YYYY-MM-DD 形式で入力してください。") from error
+        if kind not in ("schedule", "holiday"):
+            raise ValueError("無効な日課種別です。")
+        title = title.strip()
+        if kind == "holiday" and not title:
+            raise ValueError("休校・授業なしの内容を入力してください。")
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM timetable_exceptions WHERE date = ?",
+                (exception_date,),
+            ).fetchone()
+            payload = json.loads(existing["payload"]) if existing else {}
+            lessons = payload.get("lessons", []) if payload.get("kind") == kind else []
+            if kind == "holiday":
+                lessons = []
+            elif lesson is not None:
+                period = lesson["period"].strip()
+                if not period:
+                    raise ValueError("時限を入力してください。")
+                updated_lesson = {
+                    "period": period,
+                    "time": lesson["time"].strip(),
+                    "subject": lesson["subject"].strip(),
+                    "teacher": lesson["teacher"].strip(),
+                }
+                for index, existing_lesson in enumerate(lessons):
+                    if existing_lesson.get("period") == period:
+                        lessons[index] = updated_lesson
+                        break
+                else:
+                    lessons.append(updated_lesson)
+                lessons.sort(key=lambda item: (
+                    not item["period"].isdigit(),
+                    int(item["period"]) if item["period"].isdigit() else item["period"],
+                ))
+            payload = {"kind": kind, "title": title, "lessons": lessons}
+            connection.execute(
+                """INSERT INTO timetable_exceptions (date, payload) VALUES (?, ?)
+                   ON CONFLICT(date) DO UPDATE SET payload = excluded.payload""",
+                (exception_date, json.dumps(payload, ensure_ascii=False)),
+            )
+
+    def delete_timetable_exception(self, exception_date):
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM timetable_exceptions WHERE date = ?", (exception_date,)
             )
 
     @staticmethod
