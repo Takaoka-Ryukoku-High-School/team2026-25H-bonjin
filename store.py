@@ -219,6 +219,41 @@ class Store:
             )
             return str(cursor.lastrowid)
 
+    def publish_timetable(self, published_at):
+        with self._connect() as connection:
+            payloads = [
+                json.loads(row["payload"])
+                for row in connection.execute(
+                    "SELECT payload FROM items WHERE collection = 'timetable' ORDER BY id"
+                )
+            ]
+            if not payloads:
+                raise ValueError("配信する時間割がありません。科目を入力して保存してください。")
+            connection.execute(
+                """INSERT INTO metadata (key, value) VALUES ('timetable_published_at', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (published_at,),
+            )
+            connection.execute(
+                """INSERT INTO metadata (key, value) VALUES ('published_timetable', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (json.dumps(payloads, ensure_ascii=False),),
+            )
+
+    def timetable_published_at(self):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'timetable_published_at'"
+            ).fetchone()
+            return row["value"] if row else ""
+
+    def published_timetable(self):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'published_timetable'"
+            ).fetchone()
+            return json.loads(row["value"]) if row else []
+
     def delete_item(self, collection, item_id, owner_id=None):
         if collection == "tasks":
             with self._connect() as connection:

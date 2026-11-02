@@ -13,6 +13,15 @@ INK = "#202C2A"
 MUTED = "#77807B"
 WHITE = "#FFFEFA"
 WEEKDAY_OPTIONS = ("月", "火", "水", "木", "金")
+PERIOD_TIMES = {
+    "1": "09:00-09:50",
+    "2": "10:00-10:50",
+    "3": "11:00-11:50",
+    "4": "13:00-13:50",
+    "5": "14:00-14:50",
+    "6": "15:00-15:50",
+    "7": "16:00-16:50",
+}
 
 
 def text_field(label, hint, expand=True, width=None, password=False):
@@ -123,6 +132,8 @@ def main(page: ft.Page, require_login=False):
         status = ft.Text(color=MUTED, size=12)
         selected_conversation = [None]
         selected_tab = [0]
+        selected_timetable_class = [None]
+        selected_timetable_day = ["月"]
 
         def refresh(message=None):
             if message:
@@ -375,7 +386,19 @@ def main(page: ft.Page, require_login=False):
                 weekday_index = today.weekday()
                 weekday = WEEKDAY_OPTIONS[weekday_index] if weekday_index < len(WEEKDAY_OPTIONS) else None
                 classes = [item for item in store.list_items("timetable")
-                           if weekday and item.get("day") == weekday]
+                           if weekday and item.get("day") == weekday
+                           and (
+                               item.get("class_id") is None
+                               or user["role"] != "student"
+                               or item.get("class_id") == user["class_id"]
+                           )]
+                if user["role"] == "student" and user["class_id"] is not None:
+                    class_lessons = [
+                        item for item in classes
+                        if item.get("class_id") == user["class_id"]
+                    ]
+                    if class_lessons:
+                        classes = class_lessons
                 classes.sort(key=lambda item: (
                     not item.get("period", "").isdigit(),
                     int(item["period"]) if item.get("period", "").isdigit()
@@ -409,49 +432,186 @@ def main(page: ft.Page, require_login=False):
         def timetable_view():
             can_edit = user["role"] == "teacher"
             controls = []
+
+            def publish_timetable():
+                try:
+                    store.publish_timetable(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    fail(f"時間割を配信できませんでした: {error}")
+                    return
+                render_all("時間割を生徒へ配信しました")
+
             if can_edit:
-                day = ft.Dropdown(
-                    label="曜日",
-                    options=[ft.dropdown.Option(value) for value in WEEKDAY_OPTIONS],
-                    width=110,
-                )
-                period = text_field("時限", "例 1", expand=False, width=80)
-                time = text_field("時間", "例 09:00-10:30")
-                subject = text_field("授業内容・科目", "例 数学")
-                teacher = text_field("担当教師", "例 山田先生")
+                weekly_lessons = store.list_items("timetable")
+                periods = WEEKDAY_OPTIONS
+                class_scopes = [{"id": None, "name": "全クラス共通"}] + store.list_classes()
+                selected_key = selected_timetable_class[0]
+                if selected_key != "common" and selected_key not in [
+                    str(class_scope["id"]) for class_scope in class_scopes
+                    if class_scope["id"] is not None
+                ]:
+                    selected_key = "common"
+                    selected_timetable_class[0] = selected_key
+                selected_scopes = [
+                    class_scope for class_scope in class_scopes
+                    if (selected_key == "common" and class_scope["id"] is None)
+                    or (selected_key != "common"
+                        and str(class_scope["id"]) == selected_key)
+                ]
+                class_buttons = []
+                for class_scope in class_scopes:
+                    scope_key = "common" if class_scope["id"] is None else str(class_scope["id"])
+                    class_buttons.append(ft.Button(
+                        class_scope["name"],
+                        bgcolor=GREEN if selected_key == scope_key else WHITE,
+                        color="white" if selected_key == scope_key else INK,
+                        on_click=lambda e, key=scope_key: (
+                            selected_timetable_class.__setitem__(0, key),
+                            render_all(),
+                        )[1],
+                    ))
+                controls.append(panel(
+                    "クラスを選択",
+                    "表示するクラスを選ぶと、そのクラスの時間割表が開きます。",
+                    [ft.Row(class_buttons, wrap=True, spacing=8)],
+                ))
 
-                def save_weekday_lesson(e):
-                    if not day.value or not period.value or not period.value.strip() \
-                            or not time.value or not time.value.strip() \
-                            or not subject.value or not subject.value.strip():
-                        fail("曜日・時限・時間・授業内容を入力してください。")
-                        return
-                    payload = {
-                        "day": day.value,
-                        "period": period.value.strip(),
-                        "time": time.value.strip(),
-                        "subject": subject.value.strip(),
-                        "teacher": (teacher.value or "").strip(),
+                for class_scope in selected_scopes:
+                    class_id = class_scope["id"]
+                    existing_lessons = {
+                        (str(item.get("day", "")), str(item.get("slot", "")),
+                         str(item.get("period", ""))): item
+                        for item in weekly_lessons
+                        if item.get("class_id") == class_id
                     }
-                    try:
-                        existing = next(
-                            (item for item in store.list_items("timetable")
-                             if item.get("day") == payload["day"]
-                             and item.get("period") == payload["period"]),
-                            None,
-                        )
-                        if existing:
-                            store.update_item("timetable", existing["id"], payload)
-                        else:
-                            store.add_item("timetable", payload)
-                    except (OSError, sqlite3.Error, ValueError) as error:
-                        fail(f"時間割を保存できませんでした: {error}")
-                        return
-                    render_all("通常時間割を登録・更新しました")
+                    schedule_cells = {}
+                    slot_rows = (
+                        tuple(f"1-{number}" for number in range(1, 8))
+                        + tuple(f"2-{number}" for number in range(1, 8))
+                        + tuple(f"3-{number}" for number in range(1, 7))
+                    )
+                    header_controls = [ft.Container(
+                        width=60, height=30, bgcolor=GREEN_LIGHT,
+                        border=ft.Border.all(1, "#202020"),
+                    )]
+                    for period in range(1, 8):
+                        header_controls.append(ft.Container(
+                            content=ft.Text(f"{period}限目", size=13, weight=ft.FontWeight.BOLD),
+                            width=150, height=30, alignment=ft.Alignment(0, 0),
+                            bgcolor=GREEN_LIGHT, padding=5,
+                            border=ft.Border.all(1, "#202020"),
+                        ))
+                    schedule_rows = [
+                        ft.Row(header_controls, spacing=0,
+                               vertical_alignment=ft.CrossAxisAlignment.START)
+                    ]
+                    for slot in slot_rows:
+                        schedule_row = [ft.Container(
+                            content=ft.Text(slot, size=12, weight=ft.FontWeight.BOLD),
+                            width=60, height=68, alignment=ft.Alignment(0, 0),
+                            padding=5, border=ft.Border.all(1, "#202020"),
+                        )]
+                        selected_weekday = selected_timetable_day[0]
+                        for period in range(1, 8):
+                            item = existing_lessons.get(
+                                (selected_weekday, slot, str(period)), {}
+                            )
+                            subject = ft.TextField(
+                                value=item.get("subject", ""), hint_text="科目",
+                                border=ft.InputBorder.NONE, text_size=12,
+                                text_align=ft.TextAlign.CENTER, multiline=True,
+                                height=34, content_padding=ft.Padding.only(top=2, bottom=0, left=2, right=2),
+                            )
+                            teacher = ft.TextField(
+                                value=item.get("teacher", ""), hint_text="担当名",
+                                border=ft.InputBorder.NONE, text_size=10,
+                                text_align=ft.TextAlign.CENTER, multiline=True,
+                                height=28, content_padding=ft.Padding.only(top=0, bottom=2, left=2, right=2),
+                            )
+                            schedule_cells[(slot, period)] = (subject, teacher)
+                            schedule_row.append(ft.Container(
+                                content=ft.Column(
+                                    [subject, ft.Divider(height=1, thickness=1, color="#C9C9C0"), teacher],
+                                    spacing=0,
+                                ),
+                                width=150, height=68,
+                                padding=2, border=ft.Border.all(1, "#202020"),
+                            ))
+                        schedule_rows.append(ft.Row(
+                            schedule_row, spacing=0,
+                            vertical_alignment=ft.CrossAxisAlignment.START))
 
-                controls.append(panel("通常時間割", "同じ曜日・時限を再登録すると、その授業内容・担当教師に更新します。", [
-                    form([day, period, time, subject, teacher], "登録・更新", save_weekday_lesson),
-                ]))
+                    def save_weekday_schedule(e, scope_id=class_id,
+                                              cells=schedule_cells,
+                                              existing=existing_lessons):
+                        try:
+                            selected_weekday = selected_timetable_day[0]
+                            for (slot, period), (subject, teacher) in cells.items():
+                                subject_name = (subject.value or "").strip()
+                                teacher_name = (teacher.value or "").strip()
+                                current = existing.get((selected_weekday, slot, str(period)))
+                                if not subject_name:
+                                    if current:
+                                        store.delete_item("timetable", current["id"])
+                                    continue
+                                payload = {
+                                    "day": selected_weekday, "period": str(period),
+                                    "slot": slot,
+                                    "time": "",
+                                    "subject": subject_name, "teacher": teacher_name,
+                                }
+                                if scope_id is not None:
+                                    payload["class_id"] = scope_id
+                                if current:
+                                    store.update_item("timetable", current["id"], payload)
+                                else:
+                                    store.add_item("timetable", payload)
+                        except (OSError, sqlite3.Error, ValueError) as error:
+                            fail(f"時間割を保存できませんでした: {error}")
+                            return
+                        render_all("通常時間割を登録・更新しました")
+
+                    controls.append(panel(
+                        f"{class_scope['name']}の時間割を配置",
+                        "月・火・水・木・金の時間割は毎週同じ曜日に繰り返します。各マスに科目と担当教師を入力し、一括保存してください。",
+                        [
+                            ft.Row([
+                                ft.Button(
+                                    f"{weekday}曜",
+                                    bgcolor=GREEN if selected_timetable_day[0] == weekday else WHITE,
+                                    color="white" if selected_timetable_day[0] == weekday else INK,
+                                    on_click=lambda e, value=weekday: (
+                                        selected_timetable_day.__setitem__(0, value),
+                                        render_all(),
+                                    )[1],
+                                )
+                                for weekday in WEEKDAY_OPTIONS
+                            ], wrap=True, spacing=8),
+                            ft.Container(
+                                content=ft.Column(schedule_rows, spacing=0, scroll=ft.ScrollMode.AUTO),
+                                width=1110,
+                                height=1450,
+                            ),
+                            ft.Button(
+                                f"{class_scope['name']}を保存",
+                                bgcolor=GREEN, color="white",
+                                on_click=save_weekday_schedule,
+                            ),
+                            ft.Row([
+                                ft.Text(
+                                    f"最終配信: {store.timetable_published_at() or '未配信'}",
+                                    size=12,
+                                    color=MUTED,
+                                ),
+                                ft.Button(
+                                    "時間割を生徒へ配信",
+                                    bgcolor=GREEN,
+                                    color="white",
+                                    on_click=lambda e: publish_timetable(),
+                                ),
+                            ], wrap=True, spacing=8),
+                        ],
+                    ))
 
             weekly_lessons = store.list_items("timetable")
             weekly_lessons.sort(key=lambda item: (
@@ -460,19 +620,118 @@ def main(page: ft.Page, require_login=False):
                 int(item["period"]) if item.get("period", "").isdigit()
                 else item.get("period", ""),
             ))
-            weekly_rows = [
-                row("timetable", item,
-                    f"{item.get('day', '')}曜日  {item.get('period', '')}時限  {item['time']}",
-                    f"{item['subject']} ・ {item.get('teacher') or '担当未設定'}",
-                    editable=can_edit,
+            if can_edit:
+                weekly_rows = [
+                    row("timetable", item,
+                        f"{item.get('day', '')}曜日  {item.get('period', '')}時限  {item['time']}",
+                        f"{item['subject']} ・ {item.get('teacher') or '担当未設定'}",
+                        editable=True,
+                    )
+                    for item in weekly_lessons
+                ]
+                controls.append(panel("曜日ごとの通常時間割", "登録済みの通常授業一覧です。", [
+                    ft.Column(weekly_rows or [
+                        ft.Text("通常時間割はまだ登録されていません。", color=MUTED, size=13)
+                    ], spacing=0),
+                ]))
+            else:
+                slot_rows = (
+                    tuple(f"1-{number}" for number in range(1, 8))
+                    + tuple(f"2-{number}" for number in range(1, 8))
+                    + tuple(f"3-{number}" for number in range(1, 7))
                 )
-                for item in weekly_lessons
-            ]
-            controls.append(panel("曜日ごとの通常時間割", "全クラス共通の通常授業です。", [
-                ft.Column(weekly_rows or [
-                    ft.Text("通常時間割はまだ登録されていません。", color=MUTED, size=13)
-                ], spacing=0),
-            ]))
+                header = [ft.Container(
+                    width=60, height=30,
+                    bgcolor=GREEN_LIGHT, border=ft.Border.all(1, "#202020"),
+                )]
+                for period in range(1, 8):
+                    header.append(ft.Container(
+                        content=ft.Text(f"{period}限目", size=13, weight=ft.FontWeight.BOLD),
+                        width=150, height=30, alignment=ft.Alignment(0, 0),
+                        bgcolor=GREEN_LIGHT, padding=5,
+                        border=ft.Border.all(1, "#202020"),
+                    ))
+                selected_day = selected_timetable_day[0]
+                class_lessons = [
+                    item for item in store.published_timetable()
+                    if item.get("class_id") is not None
+                    and str(item.get("class_id")) == str(user.get("class_id"))
+                ]
+                common_lessons = [
+                    item for item in store.published_timetable()
+                    if item.get("class_id") is None
+                ]
+                table_rows = [ft.Row(header, spacing=0)]
+                for slot in slot_rows:
+                    cells = [ft.Container(
+                        content=ft.Text(slot, size=12, weight=ft.FontWeight.BOLD),
+                        width=60, height=68, alignment=ft.Alignment(0, 0),
+                        padding=5, border=ft.Border.all(1, "#202020"),
+                    )]
+                    for period in range(1, 8):
+                        lesson = next((
+                            item for item in class_lessons
+                            if str(item.get("day", "")) == str(selected_day)
+                            and item.get("slot", "") == slot
+                            and str(item.get("period", "")) == str(period)
+                        ), None)
+                        if lesson is None:
+                            lesson = next((
+                                item for item in common_lessons
+                                if str(item.get("day", "")) == str(selected_day)
+                                and item.get("slot", "") == slot
+                                and str(item.get("period", "")) == str(period)
+                            ), None)
+                        subject = lesson.get("subject", "") if lesson else ""
+                        teacher = lesson.get("teacher", "") if lesson else ""
+                        cells.append(ft.Container(
+                            content=ft.Column([
+                                ft.Container(
+                                    content=ft.Text(subject, size=12, text_align=ft.TextAlign.CENTER),
+                                    width=146,
+                                    height=33,
+                                    alignment=ft.Alignment(0, 0),
+                                ),
+                                ft.Divider(height=1, thickness=1, color="#C9C9C0"),
+                                ft.Container(
+                                    content=ft.Text(teacher, size=10, text_align=ft.TextAlign.CENTER),
+                                    width=146,
+                                    height=27,
+                                    alignment=ft.Alignment(0, 0),
+                                ),
+                            ], spacing=0, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                            width=150, height=68, alignment=ft.Alignment(0, 0),
+                            padding=2, border=ft.Border.all(1, "#202020"),
+                        ))
+                    table_rows.append(ft.Row(cells, spacing=0))
+                day_buttons = [
+                    ft.Button(
+                        f"{weekday}曜",
+                        bgcolor=GREEN if selected_day == weekday else WHITE,
+                        color="white" if selected_day == weekday else INK,
+                        on_click=lambda e, value=weekday: (
+                            selected_timetable_day.__setitem__(0, value),
+                            render_all(),
+                        )[1],
+                    )
+                    for weekday in WEEKDAY_OPTIONS
+                ]
+                controls.append(panel("週間時間割", "曜日を選択して時間割を確認できます。", [
+                    ft.Row(day_buttons, wrap=True, spacing=8),
+                    ft.Row([
+                        ft.Text(
+                            f"先生から配信済み: {store.timetable_published_at() or 'まだ配信されていません'}",
+                            size=12,
+                            color=MUTED,
+                        ),
+                        ft.Button("最新の時間割を更新", bgcolor=GREEN, color="white",
+                                  on_click=lambda e: render_all("最新の時間割を表示しました")),
+                    ], wrap=True, spacing=8),
+                    ft.Container(
+                        content=ft.Column(table_rows, spacing=0, scroll=ft.ScrollMode.AUTO),
+                        width=1110, height=1450,
+                    ),
+                ]))
 
             exceptions = store.list_timetable_exceptions()
             if can_edit:
