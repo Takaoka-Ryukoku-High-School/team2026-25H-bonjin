@@ -12,6 +12,12 @@ from pathlib import Path
 DATABASE_FILE = Path.home() / ".daily_note.sqlite3"
 LEGACY_FILE = Path.home() / ".daily_note_tasks.json"
 PUBLIC_COLLECTIONS = ("timetable", "reminders", "tests", "assignments", "calendar")
+WEEKDAYS = ("月", "火", "水", "木", "金")
+TIMETABLE_DELIVERY_DAYS = {
+    2: ("火",),
+    3: ("水", "金"),
+    4: ("月",),
+}
 
 
 class Store:
@@ -61,6 +67,7 @@ class Store:
             )
         os.chmod(self.path, 0o600)
         self._migrate_legacy_data()
+        self._migrate_test_publication_state()
 
     @contextmanager
     def _connect(self):
@@ -76,6 +83,20 @@ class Store:
     @staticmethod
     def _password_digest(password, salt):
         return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
+
+    def _migrate_test_publication_state(self):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, payload FROM items WHERE collection = 'tests'"
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                if "published" not in payload:
+                    payload["published"] = True
+                    connection.execute(
+                        "UPDATE items SET payload = ? WHERE id = ?",
+                        (json.dumps(payload, ensure_ascii=False), row["id"]),
+                    )
 
     def create_user(self, username, password, role, class_id=None):
         username = username.strip()
@@ -212,6 +233,9 @@ class Store:
             raise ValueError("タスクには所有者が必要です。")
         if collection != "tasks" and owner_id is not None:
             raise ValueError("共有情報に所有者は設定できません。")
+        payload = dict(payload)
+        if collection == "tests":
+            payload.setdefault("published", False)
         with self._connect() as connection:
             cursor = connection.execute(
                 "INSERT INTO items (collection, owner_id, payload) VALUES (?, ?, ?)",
@@ -219,8 +243,25 @@ class Store:
             )
             return str(cursor.lastrowid)
 
-    def publish_timetable(self, published_at):
+    def publish_timetable(self, published_at, day=None, delivery_date=None):
+        if day is not None and day not in WEEKDAYS:
+            raise ValueError("無効な曜日です。")
+        if (day is None) != (delivery_date is None):
+            raise ValueError("自動配信には曜日と配信日が必要です。")
+
         with self._connect() as connection:
+            delivery_key = None
+            if delivery_date is not None:
+                try:
+                    datetime.strptime(delivery_date, "%Y-%m-%d")
+                except ValueError as error:
+                    raise ValueError("配信日は YYYY-MM-DD 形式で入力してください。") from error
+                delivery_key = f"timetable_auto_delivery:{delivery_date}:{day}"
+                if connection.execute(
+                    "SELECT 1 FROM metadata WHERE key = ?", (delivery_key,)
+                ).fetchone():
+                    return False
+
             payloads = [
                 json.loads(row["payload"])
                 for row in connection.execute(
@@ -229,6 +270,41 @@ class Store:
             ]
             if not payloads:
                 raise ValueError("配信する時間割がありません。科目を入力して保存してください。")
+
+            published_by_day_row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'published_timetable_by_day'"
+            ).fetchone()
+            if published_by_day_row:
+                published_by_day = json.loads(published_by_day_row["value"])
+            else:
+                published_by_day = {}
+                previous_snapshot = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'published_timetable'"
+                ).fetchone()
+                previous_published_at = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'timetable_published_at'"
+                ).fetchone()
+                if previous_snapshot:
+                    previous_lessons = json.loads(previous_snapshot["value"])
+                    previous_time = previous_published_at["value"] if previous_published_at else ""
+                    for weekday in WEEKDAYS:
+                        published_by_day[weekday] = {
+                            "published_at": previous_time,
+                            "lessons": [
+                                item for item in previous_lessons
+                                if item.get("day") == weekday
+                            ],
+                        }
+
+            days_to_publish = (day,) if day is not None else WEEKDAYS
+            for weekday in days_to_publish:
+                published_by_day[weekday] = {
+                    "published_at": published_at,
+                    "lessons": [
+                        item for item in payloads if item.get("day") == weekday
+                    ],
+                }
+
             connection.execute(
                 """INSERT INTO metadata (key, value) VALUES ('timetable_published_at', ?)
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
@@ -239,6 +315,35 @@ class Store:
                    ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                 (json.dumps(payloads, ensure_ascii=False),),
             )
+            connection.execute(
+                """INSERT INTO metadata (key, value)
+                   VALUES ('published_timetable_by_day', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (json.dumps(published_by_day, ensure_ascii=False),),
+            )
+            if delivery_key is not None:
+                connection.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    (delivery_key, published_at),
+                )
+            return True
+
+    def publish_due_timetables(self, now=None):
+        now = now or datetime.now()
+        if (now.hour, now.minute) < (15, 0):
+            return []
+
+        days = TIMETABLE_DELIVERY_DAYS.get(now.weekday(), ())
+        published = []
+        for day in days:
+            was_published = self.publish_timetable(
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                day=day,
+                delivery_date=now.date().isoformat(),
+            )
+            if was_published:
+                published.append(day)
+        return published
 
     def timetable_published_at(self):
         with self._connect() as connection:
@@ -253,6 +358,32 @@ class Store:
                 "SELECT value FROM metadata WHERE key = 'published_timetable'"
             ).fetchone()
             return json.loads(row["value"]) if row else []
+
+    def published_timetable_for_day(self, day):
+        if day not in WEEKDAYS:
+            raise ValueError("無効な曜日です。")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'published_timetable_by_day'"
+            ).fetchone()
+            if row:
+                publication = json.loads(row["value"]).get(day, {})
+                return {
+                    "published_at": publication.get("published_at", ""),
+                    "lessons": publication.get("lessons", []),
+                }
+
+            snapshot = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'published_timetable'"
+            ).fetchone()
+            published_at = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'timetable_published_at'"
+            ).fetchone()
+            lessons = json.loads(snapshot["value"]) if snapshot else []
+            return {
+                "published_at": published_at["value"] if published_at else "",
+                "lessons": [item for item in lessons if item.get("day") == day],
+            }
 
     def delete_item(self, collection, item_id, owner_id=None):
         if collection == "tasks":
@@ -279,10 +410,53 @@ class Store:
         if collection not in PUBLIC_COLLECTIONS:
             raise ValueError("このデータは更新できません。")
         with self._connect() as connection:
+            if collection == "tests":
+                existing = connection.execute(
+                    "SELECT payload FROM items WHERE id = ? AND collection = ?",
+                    (item_id, collection),
+                ).fetchone()
+                if existing is not None:
+                    old_payload = json.loads(existing["payload"])
+                    payload = dict(payload)
+                    payload.setdefault("published", old_payload.get("published", False))
             connection.execute(
                 "UPDATE items SET payload = ? WHERE id = ? AND collection = ?",
                 (json.dumps(payload, ensure_ascii=False), item_id, collection),
             )
+
+    def set_test_published(self, item_id, published):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM items WHERE id = ? AND collection = 'tests'",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            payload = json.loads(row["payload"])
+            payload["published"] = bool(published)
+            connection.execute(
+                "UPDATE items SET payload = ? WHERE id = ? AND collection = 'tests'",
+                (json.dumps(payload, ensure_ascii=False), item_id),
+            )
+            return True
+
+    def publish_all_tests(self):
+        published_count = 0
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, payload FROM items WHERE collection = 'tests'"
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                if payload.get("published", False):
+                    continue
+                payload["published"] = True
+                connection.execute(
+                    "UPDATE items SET payload = ? WHERE id = ? AND collection = 'tests'",
+                    (json.dumps(payload, ensure_ascii=False), row["id"]),
+                )
+                published_count += 1
+        return published_count
 
     def list_timetable_exceptions(self):
         with self._connect() as connection:

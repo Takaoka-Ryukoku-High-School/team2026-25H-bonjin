@@ -1,3 +1,4 @@
+from datetime import datetime
 import sqlite3
 import tempfile
 import unittest
@@ -55,6 +56,121 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["subject"], "英語")
         self.assertEqual(saved[0]["teacher"], "佐藤先生")
+
+    def test_automatic_timetable_delivery_schedule_and_per_day_snapshots(self):
+        for day in ("月", "火", "水", "金"):
+            self.store.add_item("timetable", {
+                "day": day, "period": "1", "time": "09:00-10:00",
+                "subject": f"{day}曜の授業", "teacher": "先生",
+            })
+
+        self.assertEqual(
+            self.store.publish_due_timetables(datetime(2026, 11, 11, 14, 59)), []
+        )
+        self.assertEqual(
+            self.store.publish_due_timetables(datetime(2026, 11, 11, 15, 0)), ["火"]
+        )
+        self.assertEqual(
+            self.store.publish_due_timetables(datetime(2026, 11, 11, 15, 1)), []
+        )
+        self.assertEqual(
+            self.store.published_timetable_for_day("火")["lessons"][0]["subject"],
+            "火曜の授業",
+        )
+        self.assertEqual(
+            self.store.published_timetable_for_day("月")["lessons"], []
+        )
+
+        self.assertEqual(
+            self.store.publish_due_timetables(datetime(2026, 11, 12, 15, 0)),
+            ["水", "金"],
+        )
+        self.assertEqual(
+            self.store.publish_due_timetables(datetime(2026, 11, 13, 15, 0)), ["月"]
+        )
+        self.assertEqual(
+            self.store.published_timetable_for_day("水")["lessons"][0]["subject"],
+            "水曜の授業",
+        )
+        self.assertEqual(
+            self.store.published_timetable_for_day("金")["lessons"][0]["subject"],
+            "金曜の授業",
+        )
+        self.assertEqual(
+            self.store.published_timetable_for_day("月")["lessons"][0]["subject"],
+            "月曜の授業",
+        )
+
+    def test_manual_timetable_publish_still_publishes_all_weekdays(self):
+        for day in ("月", "火"):
+            self.store.add_item("timetable", {
+                "day": day, "period": "1", "time": "09:00-10:00",
+                "subject": f"{day}曜の授業", "teacher": "先生",
+            })
+
+        self.store.publish_timetable("2026-11-09 12:00:00")
+
+        self.assertTrue(self.store.published_timetable_for_day("月")["published_at"])
+        self.assertTrue(self.store.published_timetable_for_day("火")["published_at"])
+
+    def test_reminder_content_and_schedule_can_be_updated(self):
+        item_id = self.store.add_item("reminders", {
+            "title": "提出物を確認",
+            "when": "2026-11-10 07:00",
+        })
+
+        self.store.update_item("reminders", item_id, {
+            "title": "数学の課題を提出",
+            "when": "2026-11-09 18:30",
+        })
+
+        reminder = self.store.list_items("reminders")[0]
+        self.assertEqual(reminder["title"], "数学の課題を提出")
+        self.assertEqual(reminder["when"], "2026-11-09 18:30")
+
+    def test_test_schedule_and_range_are_saved(self):
+        item_id = self.store.add_item("tests", {
+            "subject": "数学",
+            "date": "2026-11-10",
+            "time": "09:00",
+            "detail": "教科書 p.10-30",
+        })
+
+        test = self.store.list_items("tests")[0]
+        self.assertEqual(test["subject"], "数学")
+        self.assertEqual(test["date"], "2026-11-10")
+        self.assertEqual(test["time"], "09:00")
+        self.assertEqual(test["detail"], "教科書 p.10-30")
+        self.assertFalse(test["published"])
+
+        self.assertTrue(self.store.set_test_published(item_id, True))
+        self.store.update_item("tests", item_id, {
+            "subject": "数学",
+            "date": "2026-11-10",
+            "time": "09:00",
+            "detail": "教科書 p.10-35",
+        })
+        self.assertTrue(self.store.list_items("tests")[0]["published"])
+
+    def test_existing_tests_without_publication_flag_remain_visible_to_students(self):
+        with self.store._connect() as connection:
+            connection.execute(
+                "INSERT INTO items (collection, owner_id, payload) VALUES ('tests', NULL, ?)",
+                ('{"subject":"既存のテスト","date":"2026-11-10","time":"09:00","detail":"範囲"}',),
+            )
+
+        reopened_store = Store(self.database)
+
+        self.assertTrue(reopened_store.list_items("tests")[0]["published"])
+
+    def test_publish_all_tests_publishes_only_unpublished_items(self):
+        first_id = self.store.add_item("tests", {"subject": "数学"})
+        second_id = self.store.add_item("tests", {"subject": "英語"})
+        self.store.set_test_published(first_id, True)
+
+        self.assertEqual(self.store.publish_all_tests(), 1)
+        self.assertEqual(self.store.publish_all_tests(), 0)
+        self.assertTrue(all(item["published"] for item in self.store.list_items("tests")))
 
     def test_date_override_replaces_weekly_schedule_and_upserts_periods(self):
         self.store.add_item("timetable", {

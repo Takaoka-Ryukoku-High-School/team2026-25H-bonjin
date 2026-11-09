@@ -134,6 +134,7 @@ def main(page: ft.Page, require_login=False):
         selected_tab = [0]
         selected_timetable_class = [None]
         selected_timetable_day = ["月"]
+        selected_reminder_to_edit = [None]
 
         def refresh(message=None):
             if message:
@@ -144,7 +145,7 @@ def main(page: ft.Page, require_login=False):
             status.value = message
             page.update()
 
-        def row(collection, item, title, detail="", editable=False):
+        def row(collection, item, title, detail="", editable=False, on_edit=None):
             controls = []
             if collection == "tasks":
                 controls.append(ft.Checkbox(
@@ -164,6 +165,13 @@ def main(page: ft.Page, require_login=False):
                 labels.append(ft.Text(detail, size=12, color=MUTED))
             controls.append(ft.Column(labels, spacing=3, expand=True))
             if editable:
+                if on_edit:
+                    controls.append(ft.IconButton(
+                        icon=ft.Icons.EDIT_OUTLINED,
+                        icon_color=MUTED,
+                        tooltip="編集",
+                        on_click=lambda e: on_edit(),
+                    ))
                 controls.append(ft.IconButton(
                     icon=ft.Icons.DELETE_OUTLINE,
                     icon_color=MUTED,
@@ -225,6 +233,9 @@ def main(page: ft.Page, require_login=False):
                         item_id,
                         owner_id=user["id"] if collection == "tasks" else None,
                     )
+                if (collection == "reminders" and selected_reminder_to_edit[0]
+                        and selected_reminder_to_edit[0]["id"] == item_id):
+                    selected_reminder_to_edit[0] = None
             except (OSError, sqlite3.Error) as error:
                 fail(f"削除できませんでした: {error}")
                 return
@@ -246,6 +257,7 @@ def main(page: ft.Page, require_login=False):
         def items_panel(collection, title, description):
             title_display = lambda item: ""
             detail_display = lambda item: ""
+            on_edit_item = lambda item: None
             if collection == "timetable":
                 day = ft.Dropdown(
                     label="曜日",
@@ -264,31 +276,62 @@ def main(page: ft.Page, require_login=False):
                 title_display = lambda item: f"{item['day']}曜日  {item['time']}"
                 detail_display = lambda item: item["subject"]
             elif collection == "reminders":
-                reminder_title = text_field("通知内容", "例 レポート提出を確認")
-                when = text_field("通知時刻", "YYYY-MM-DD HH:MM")
-                inputs = [reminder_title, when]
+                editing_reminder = selected_reminder_to_edit
+                reminder_title = ft.TextField(
+                    label="通知内容",
+                    hint_text="例 レポート提出を確認",
+                    multiline=True,
+                    min_lines=1,
+                    max_lines=4,
+                    expand=True,
+                )
+                reminder_date = text_field("通知日", "YYYY-MM-DD", expand=False, width=150)
+                reminder_time = text_field("通知時刻", "HH:MM", expand=False, width=120)
+                inputs = [reminder_title, reminder_date, reminder_time]
+                if editing_reminder[0]:
+                    reminder_title.value = editing_reminder[0]["title"]
+                    date_value, _, time_value = editing_reminder[0].get("when", "").partition(" ")
+                    reminder_date.value = date_value
+                    reminder_time.value = time_value
+
+                def set_reminder_form(item=None):
+                    selected_reminder_to_edit[0] = item
+                    render_all()
 
                 def add(e):
-                    if reminder_title.value and reminder_title.value.strip() and when.value and when.value.strip():
-                        add_item(collection, {"title": reminder_title.value.strip(),
-                                              "when": when.value.strip()}, "通知を登録しました")
+                    content = (reminder_title.value or "").strip()
+                    date_value = (reminder_date.value or "").strip()
+                    time_value = (reminder_time.value or "").strip()
+                    if not content or not date_value or not time_value:
+                        fail("通知内容・通知日・通知時刻を入力してください。")
+                        return
+                    try:
+                        scheduled_at = datetime.strptime(
+                            f"{date_value} {time_value}", "%Y-%m-%d %H:%M"
+                        ).strftime("%Y-%m-%d %H:%M")
+                        item = editing_reminder[0]
+                        if item:
+                            store.update_item(collection, item["id"], {
+                                "title": content,
+                                "when": scheduled_at,
+                            })
+                            selected_reminder_to_edit[0] = None
+                            render_all("通知を更新しました")
+                        else:
+                            add_item(collection, {"title": content, "when": scheduled_at},
+                                     "通知を登録しました")
+                    except ValueError:
+                        fail("通知日は YYYY-MM-DD、通知時刻は HH:MM 形式で入力してください。")
+                    except (OSError, sqlite3.Error) as error:
+                        fail(f"通知を保存できませんでした: {error}")
 
                 title_display = lambda item: item["title"]
                 detail_display = lambda item: f"通知時刻: {item['when']}"
+                on_edit_item = lambda item: set_reminder_form(item)
             elif collection == "tests":
-                subject = text_field("科目", "数学")
-                date = text_field("試験日", "YYYY-MM-DD")
-                detail = text_field("範囲・メモ", "教科書 p.10-30")
-                inputs = [subject, date, detail]
-
-                def add(e):
-                    if subject.value and subject.value.strip() and date.value and date.value.strip():
-                        add_item(collection, {"subject": subject.value.strip(),
-                                              "date": date.value.strip(),
-                                              "detail": (detail.value or "").strip()},
-                                 "テストを登録しました")
-
-                title_display = lambda item: f"{item['subject']}  {item['date']}"
+                title_display = lambda item: (
+                    f"{item['subject']}  {item['date']} {item.get('time', '')}".strip()
+                )
                 detail_display = lambda item: item.get("detail", "")
             elif collection == "assignments":
                 assignment_title = text_field("課題名", "レポート・宿題")
@@ -321,24 +364,315 @@ def main(page: ft.Page, require_login=False):
                 title_display = lambda item: f"{item['date']}  {item['title']}"
                 detail_display = lambda item: item.get("detail", "")
 
-            can_edit = user["role"] == "teacher"
+            can_edit = user["role"] == "teacher" or collection == "tests"
             if can_edit:
-                fields = [form(inputs, "登録する", add)]
+                if collection == "tests":
+                    fields = []
+                else:
+                    button_text = (
+                        "通知を更新" if collection == "reminders" and editing_reminder[0]
+                        else "登録する"
+                    )
+                    fields = [form(inputs, button_text, add)]
+                    if collection == "reminders" and editing_reminder[0]:
+                        fields.append(ft.TextButton(
+                            "編集をキャンセル",
+                            on_click=lambda e: set_reminder_form(),
+                        ))
             else:
                 fields = []
             items = store.list_items(collection)
-            if collection == "calendar":
-                items.sort(key=lambda item: item.get("date", ""))
+            if collection in ("calendar", "tests"):
+                items.sort(key=lambda item: (
+                    item.get("date", ""),
+                    item.get("time", ""),
+                ))
+            if collection == "reminders":
+                items.sort(key=lambda item: item.get("when", ""))
             if collection == "tests":
-                items.sort(key=lambda item: item.get("date", ""))
-            rows = [
-                row(collection, item, title_display(item), detail_display(item), editable=can_edit)
-                for item in items
-            ]
-            fields.append(ft.Column(
-                rows or [ft.Text("登録された情報はありません。", color=MUTED, size=13)],
-                spacing=0,
-            ))
+                if user["role"] == "student":
+                    items = [item for item in items if item.get("published", False)]
+                    test_cards = [
+                        ft.Container(
+                            content=ft.Column([
+                                ft.Text(
+                                    item.get("subject", ""),
+                                    size=17,
+                                    color=INK,
+                                    weight=ft.FontWeight.W_600,
+                                ),
+                                ft.Text(
+                                    f"試験日時: {item.get('date', '')} "
+                                    f"{item.get('time', '')}".strip(),
+                                    size=13,
+                                    color=MUTED,
+                                ),
+                                ft.Divider(height=1, color="#DEDFD5"),
+                                ft.Text("試験範囲", size=12, color=MUTED),
+                                ft.Text(
+                                    item.get("detail", "") or "範囲は未登録です。",
+                                    size=14,
+                                    color=INK,
+                                ),
+                            ], spacing=7),
+                            padding=14,
+                            bgcolor=WHITE,
+                            border=ft.Border.all(1, "#E3E3D9"),
+                            border_radius=6,
+                        )
+                        for item in items
+                    ]
+                    fields.append(ft.Column(
+                        test_cards or [
+                            ft.Text("先生から配信されたテストはありません。", color=MUTED)
+                        ],
+                        spacing=10,
+                    ))
+                    return panel(title, description, fields)
+                column_specs = (
+                    ("科目", 150),
+                    ("試験日", 140),
+                    ("開始時刻", 120),
+                    ("試験範囲", 300),
+                )
+                is_teacher = user["role"] == "teacher"
+
+                def grid_cell(content, width, header=False):
+                    return ft.Container(
+                        content=content,
+                        width=width,
+                        padding=6,
+                        bgcolor=GREEN_LIGHT if header else WHITE,
+                        border=ft.Border.all(1, "#202020"),
+                    )
+
+                table_rows = [ft.Row([
+                    grid_cell(ft.Text(label, size=12, weight=ft.FontWeight.BOLD), width, True)
+                    for label, width in column_specs
+                ] + [grid_cell(
+                    ft.Text("操作", size=12, weight=ft.FontWeight.BOLD),
+                    250 if is_teacher else 110,
+                    True,
+                )],
+                    spacing=0)]
+                editable_test_rows = []
+
+                def make_test_fields(item=None):
+                    return (
+                        ft.TextField(
+                            label="科目",
+                            hint_text="例 数学",
+                            value=item.get("subject", "") if item else "",
+                            width=138,
+                            border_radius=6,
+                            border_color="#D4DED5",
+                            focused_border_color=GREEN,
+                            bgcolor=WHITE,
+                            text_size=14,
+                        ),
+                        ft.TextField(
+                            label="試験日",
+                            hint_text="YYYY-MM-DD",
+                            value=item.get("date", "") if item else "",
+                            width=128,
+                            border_radius=6,
+                            border_color="#D4DED5",
+                            focused_border_color=GREEN,
+                            bgcolor=WHITE,
+                            text_size=14,
+                        ),
+                        ft.TextField(
+                            label="時刻",
+                            hint_text="HH:MM",
+                            value=item.get("time", "") if item else "",
+                            width=108,
+                            border_radius=6,
+                            border_color="#D4DED5",
+                            focused_border_color=GREEN,
+                            bgcolor=WHITE,
+                            text_size=14,
+                        ),
+                        ft.TextField(
+                            label="範囲",
+                            hint_text="教科書 p.10-30",
+                            value=item.get("detail", "") if item else "",
+                            multiline=True,
+                            min_lines=1,
+                            max_lines=3,
+                            width=288,
+                        ),
+                    )
+
+                def save_test(e, item_id, subject_field, date_field,
+                              time_field, detail_field):
+                    if not is_teacher:
+                        fail("テスト予定の編集は先生のみ行えます。")
+                        return
+                    subject_value = (subject_field.value or "").strip()
+                    date_value = (date_field.value or "").strip()
+                    time_value = (time_field.value or "").strip()
+                    if not subject_value or not date_value or not time_value:
+                        fail("科目・試験日・開始時刻を入力してください。")
+                        return
+                    try:
+                        date_value = datetime.strptime(date_value, "%Y-%m-%d").strftime("%Y-%m-%d")
+                        time_value = datetime.strptime(time_value, "%H:%M").strftime("%H:%M")
+                        payload = {
+                            "subject": subject_value,
+                            "date": date_value,
+                            "time": time_value,
+                            "detail": (detail_field.value or "").strip(),
+                        }
+                        if item_id is None:
+                            store.add_item("tests", payload)
+                            render_all("テスト予定を登録しました")
+                        else:
+                            store.update_item("tests", item_id, payload)
+                            render_all("テスト予定を保存しました")
+                    except ValueError:
+                        fail("試験日は YYYY-MM-DD、開始時刻は HH:MM 形式で入力してください。")
+                    except (OSError, sqlite3.Error) as error:
+                        fail(f"テスト予定を保存できませんでした: {error}")
+
+                def publish_all_tests(e):
+                    if not is_teacher:
+                        fail("テスト予定の配信は先生のみ行えます。")
+                        return
+                    try:
+                        changes = []
+                        for item_id, subject_field, date_field, time_field, detail_field in editable_test_rows:
+                            subject_value = (subject_field.value or "").strip()
+                            date_value = (date_field.value or "").strip()
+                            time_value = (time_field.value or "").strip()
+                            detail_value = (detail_field.value or "").strip()
+                            if item_id is None and not any(
+                                (subject_value, date_value, time_value, detail_value)
+                            ):
+                                continue
+                            if not subject_value or not date_value or not time_value:
+                                fail("配信するテストは科目・試験日・開始時刻を入力してください。")
+                                return
+                            date_value = datetime.strptime(date_value, "%Y-%m-%d").strftime("%Y-%m-%d")
+                            time_value = datetime.strptime(time_value, "%H:%M").strftime("%H:%M")
+                            changes.append((item_id, {
+                                "subject": subject_value,
+                                "date": date_value,
+                                "time": time_value,
+                                "detail": detail_value,
+                            }))
+                        for item_id, payload in changes:
+                            if item_id is None:
+                                store.add_item("tests", payload)
+                            else:
+                                store.update_item("tests", item_id, payload)
+                        published_count = store.publish_all_tests()
+                    except ValueError:
+                        fail("試験日は YYYY-MM-DD、開始時刻は HH:MM 形式で入力してください。")
+                        return
+                    except (OSError, sqlite3.Error) as error:
+                        fail(f"テスト予定を保存・配信できませんでした: {error}")
+                        return
+                    render_all(
+                        f"入力内容を保存し、テストを{published_count}件生徒側へ配信しました。"
+                        if published_count
+                        else "入力内容を保存しました。配信する未配信のテストはありません。"
+                    )
+
+                if is_teacher:
+                    fields.append(ft.Button(
+                        "入力内容を保存して生徒へ配信",
+                        bgcolor=GREEN,
+                        color="white",
+                        on_click=publish_all_tests,
+                    ))
+
+                for item in items:
+                    if is_teacher:
+                        subject_field, date_field, time_field, detail_field = make_test_fields(item)
+                        editable_test_rows.append((
+                            item["id"], subject_field, date_field, time_field, detail_field,
+                        ))
+                        action_controls = [
+                            ft.Button(
+                                "保存",
+                                bgcolor=GREEN,
+                                color="white",
+                                on_click=lambda e, item_id=item["id"],
+                                subject=subject_field, date=date_field,
+                                time=time_field, detail=detail_field: save_test(
+                                    e, item_id, subject, date, time, detail
+                                ),
+                            ),
+                            ft.IconButton(
+                                icon=ft.Icons.DELETE_OUTLINE,
+                                icon_color=MUTED,
+                                tooltip="削除",
+                                on_click=lambda e, item_id=item["id"]: remove_item(
+                                    "tests", item_id
+                                ),
+                            ),
+                        ]
+                        cells = [
+                            grid_cell(subject_field, 150),
+                            grid_cell(date_field, 140),
+                            grid_cell(time_field, 120),
+                            grid_cell(detail_field, 300),
+                        ]
+                    else:
+                        cells = [
+                            grid_cell(ft.Text(item.get(key, ""), size=13), width)
+                            for key, width in (
+                                ("subject", 150), ("date", 140),
+                                ("time", 120), ("detail", 300),
+                            )
+                        ]
+                        action_controls = []
+                    table_rows.append(ft.Row(cells + [
+                        grid_cell(ft.Row(action_controls, spacing=0), 250 if is_teacher else 110),
+                    ], spacing=0))
+
+                if is_teacher:
+                    new_subject, new_date, new_time, new_detail = make_test_fields()
+                    editable_test_rows.append((
+                        None, new_subject, new_date, new_time, new_detail,
+                    ))
+                    table_rows.append(ft.Row([
+                        grid_cell(new_subject, 150),
+                        grid_cell(new_date, 140),
+                        grid_cell(new_time, 120),
+                        grid_cell(new_detail, 300),
+                        grid_cell(ft.Button(
+                            "登録（未配信）",
+                            bgcolor=GREEN,
+                            color="white",
+                            on_click=lambda e: save_test(
+                                e, None, new_subject, new_date, new_time, new_detail
+                            ),
+                        ), 250),
+                    ], spacing=0))
+                elif not items:
+                    table_rows.append(ft.Row([
+                        grid_cell(ft.Text("先生から配信されたテストはありません。", color=MUTED), 710),
+                        grid_cell(ft.Text(""), 110),
+                    ], spacing=0))
+                fields.append(ft.Column(
+                    [ft.Row(table_rows, spacing=0, scroll=ft.ScrollMode.AUTO)],
+                    scroll=ft.ScrollMode.AUTO,
+                ))
+            else:
+                rows = [
+                    row(
+                        collection, item, title_display(item), detail_display(item),
+                        editable=can_edit,
+                        on_edit=(lambda item=item: on_edit_item(item))
+                        if collection == "reminders" and can_edit else None,
+                    )
+                    for item in items
+                ]
+                fields.append(ft.Column(
+                    rows or [ft.Text("登録された情報はありません。", color=MUTED, size=13)],
+                    spacing=0,
+                ))
             role_description = "先生が登録・編集できます。" if not can_edit else description
             return panel(title, role_description, fields)
 
@@ -385,7 +719,12 @@ def main(page: ft.Page, require_login=False):
             else:
                 weekday_index = today.weekday()
                 weekday = WEEKDAY_OPTIONS[weekday_index] if weekday_index < len(WEEKDAY_OPTIONS) else None
-                classes = [item for item in store.list_items("timetable")
+                lessons = (
+                    store.published_timetable_for_day(weekday)["lessons"]
+                    if user["role"] == "student" and weekday
+                    else store.list_items("timetable")
+                )
+                classes = [item for item in lessons
                            if weekday and item.get("day") == weekday
                            and (
                                item.get("class_id") is None
@@ -652,13 +991,14 @@ def main(page: ft.Page, require_login=False):
                         border=ft.Border.all(1, "#202020"),
                     ))
                 selected_day = selected_timetable_day[0]
+                day_publication = store.published_timetable_for_day(selected_day)
                 class_lessons = [
-                    item for item in store.published_timetable()
+                    item for item in day_publication["lessons"]
                     if item.get("class_id") is not None
                     and str(item.get("class_id")) == str(user.get("class_id"))
                 ]
                 common_lessons = [
-                    item for item in store.published_timetable()
+                    item for item in day_publication["lessons"]
                     if item.get("class_id") is None
                 ]
                 table_rows = [ft.Row(header, spacing=0)]
@@ -718,9 +1058,17 @@ def main(page: ft.Page, require_login=False):
                 ]
                 controls.append(panel("週間時間割", "曜日を選択して時間割を確認できます。", [
                     ft.Row(day_buttons, wrap=True, spacing=8),
+                    ft.Text(
+                        f"この曜日の配信: {day_publication['published_at'] or '未配信'}"
+                        if day_publication["published_at"]
+                        else "この曜日はまだ未配信です。月曜は金曜15時、火曜は水曜15時、"
+                             "水曜・金曜は木曜15時に自動配信されます。",
+                        size=12,
+                        color=MUTED,
+                    ),
                     ft.Row([
                         ft.Text(
-                            f"先生から配信済み: {store.timetable_published_at() or 'まだ配信されていません'}",
+                            f"最終配信: {store.timetable_published_at() or 'まだ配信されていません'}",
                             size=12,
                             color=MUTED,
                         ),
@@ -852,12 +1200,16 @@ def main(page: ft.Page, require_login=False):
 
         def reminders_view():
             return items_panel(
-                "reminders", "時間指定通知", "通知内容と時刻を登録します。",
+                "reminders", "時間指定通知",
+                "好きな日付・時刻を指定できます。例: 前日の夜、当日7:00。登録した通知は生徒側に表示されます。",
             )
 
         def tests_view():
             return items_panel(
-                "tests", "テスト管理", "試験日と範囲を登録して対策状況を管理します。",
+                "tests", "テスト管理",
+                "時間割表のように入力・編集できます。先生は「配信」すると生徒側に表示されます。"
+                if user["role"] == "teacher"
+                else "先生から配信されたテスト予定を確認できます。",
             )
 
         def assignments_view():

@@ -65,6 +65,46 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(controls[0].value, "ログイン")
         self.assertEqual(controls[1].label, "ユーザー名")
 
+    def test_students_only_see_teacher_published_tests(self):
+        teacher_page = FakePage()
+        dashboard.main(teacher_page)
+        picker_controls = teacher_page.controls[0].content.controls
+        picker_controls[3].controls[0].on_click(None)
+        tabs = teacher_page.controls[0].content.controls[2]
+        teacher_test_view = tabs.content.controls[1].controls[3]
+        grid = teacher_test_view.controls[0].content.controls[3].controls[0]
+        new_row = grid.controls[-1]
+        subject, date, time, detail = [
+            cell.content for cell in new_row.controls[:4]
+        ]
+        subject.value = "理科"
+        date.value = "2026-11-12"
+        time.value = "09:00"
+        detail.value = "教科書 p.20-30"
+        publish_button = teacher_test_view.controls[0].content.controls[2]
+        publish_button.on_click(None)
+
+        test = self.store.list_items("tests")[-1]
+        self.assertEqual(test["subject"], "理科")
+        self.assertEqual(test["date"], "2026-11-12")
+        self.assertEqual(test["time"], "09:00")
+        self.assertEqual(test["detail"], "教科書 p.20-30")
+        self.assertTrue(self.store.list_items("tests")[-1]["published"])
+
+        student_page = FakePage()
+        dashboard.main(student_page)
+        picker_controls = student_page.controls[0].content.controls
+        picker_controls[3].controls[1].on_click(None)
+        tabs = student_page.controls[0].content.controls[2]
+        student_test_view = tabs.content.controls[1].controls[4]
+        student_panel = student_test_view.controls[0]
+        cards = student_panel.content.controls[2].controls
+        test_card = cards[0]
+        self.assertEqual(test_card.content.controls[0].value, "理科")
+        self.assertEqual(test_card.content.controls[1].value, "試験日時: 2026-11-12 09:00")
+        self.assertEqual(test_card.content.controls[3].value, "試験範囲")
+        self.assertEqual(test_card.content.controls[4].value, "教科書 p.20-30")
+
 
 if __name__ == "__main__":
     unittest.main()
