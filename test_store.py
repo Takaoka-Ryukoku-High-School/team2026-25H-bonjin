@@ -172,6 +172,20 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.publish_all_tests(), 0)
         self.assertTrue(all(item["published"] for item in self.store.list_items("tests")))
 
+    def test_test_subject_lists_are_persisted_per_grade(self):
+        self.assertEqual(
+            self.store.list_test_subjects("1年生"),
+            ["数学", "英語", "言語文化", "現代国", "地基", "歴史", "人間学", "家庭科"],
+        )
+        self.assertEqual(self.store.list_test_subjects("2年生"), [])
+
+        self.assertTrue(self.store.add_test_subject("2年生", "化学"))
+        self.assertFalse(self.store.add_test_subject("2年生", "化学"))
+
+        reopened_store = Store(self.database)
+        self.assertEqual(reopened_store.list_test_subjects("2年生"), ["化学"])
+        self.assertEqual(reopened_store.list_test_subjects("3年生"), [])
+
     def test_date_override_replaces_weekly_schedule_and_upserts_periods(self):
         self.store.add_item("timetable", {
             "day": "月", "period": "1", "time": "09:00-10:30",

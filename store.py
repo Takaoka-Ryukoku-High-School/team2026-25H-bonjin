@@ -18,6 +18,12 @@ TIMETABLE_DELIVERY_DAYS = {
     3: ("水", "金"),
     4: ("月",),
 }
+TEST_GRADES = ("1年生", "2年生", "3年生")
+DEFAULT_TEST_SUBJECTS = {
+    "1年生": ("数学", "英語", "言語文化", "現代国", "地基", "歴史", "人間学", "家庭科"),
+    "2年生": (),
+    "3年生": (),
+}
 
 
 class Store:
@@ -457,6 +463,40 @@ class Store:
                 )
                 published_count += 1
         return published_count
+
+    def list_test_subjects(self, grade):
+        if grade not in TEST_GRADES:
+            raise ValueError("無効な学年です。")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'test_subjects'"
+            ).fetchone()
+            configured = json.loads(row["value"]) if row else {}
+        return list(configured.get(grade, DEFAULT_TEST_SUBJECTS[grade]))
+
+    def add_test_subject(self, grade, subject):
+        if grade not in TEST_GRADES:
+            raise ValueError("無効な学年です。")
+        subject = subject.strip()
+        if not subject:
+            raise ValueError("教科名を入力してください。")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'test_subjects'"
+            ).fetchone()
+            configured = json.loads(row["value"]) if row else {}
+            subjects = configured.setdefault(
+                grade, list(DEFAULT_TEST_SUBJECTS[grade])
+            )
+            if subject in subjects:
+                return False
+            subjects.append(subject)
+            connection.execute(
+                """INSERT INTO metadata (key, value) VALUES ('test_subjects', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (json.dumps(configured, ensure_ascii=False),),
+            )
+        return True
 
     def list_timetable_exceptions(self):
         with self._connect() as connection:

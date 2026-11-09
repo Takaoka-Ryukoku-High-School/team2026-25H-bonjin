@@ -72,16 +72,22 @@ class DashboardTests(unittest.TestCase):
         picker_controls[3].controls[0].on_click(None)
         tabs = teacher_page.controls[0].content.controls[2]
         teacher_test_view = tabs.content.controls[1].controls[3]
-        grid = teacher_test_view.controls[0].content.controls[3].controls[0]
-        new_row = grid.controls[-1]
-        subject, date, time, detail = [
-            cell.content for cell in new_row.controls[:4]
-        ]
+        test_panel = teacher_test_view.controls[0]
+        test_rows = test_panel.content.controls[4]
+        self.assertEqual(
+            [
+                row.content.controls[0].value
+                for row in test_rows.controls
+            ],
+            ["数学", "英語", "言語文化", "現代国", "地基", "歴史", "人間学", "家庭科"],
+        )
+        new_row = test_rows.controls[0]
+        subject, date, time, detail = new_row.content.controls[:4]
         subject.value = "理科"
         date.value = "2026-11-12"
         time.value = "09:00"
         detail.value = "教科書 p.20-30"
-        publish_button = teacher_test_view.controls[0].content.controls[2]
+        publish_button = new_row.content.controls[4].controls[0]
         publish_button.on_click(None)
 
         test = self.store.list_items("tests")[-1]
@@ -98,12 +104,77 @@ class DashboardTests(unittest.TestCase):
         tabs = student_page.controls[0].content.controls[2]
         student_test_view = tabs.content.controls[1].controls[4]
         student_panel = student_test_view.controls[0]
-        cards = student_panel.content.controls[2].controls
+        refresh_button = student_panel.content.controls[2]
+        refresh_button.on_click(None)
+        student_panel = student_page.controls[0].content.controls[2].content.controls[1].controls[4].controls[0]
+        cards = student_panel.content.controls[3].controls
         test_card = cards[0]
         self.assertEqual(test_card.content.controls[0].value, "理科")
         self.assertEqual(test_card.content.controls[1].value, "試験日時: 2026-11-12 09:00")
-        self.assertEqual(test_card.content.controls[3].value, "試験範囲")
         self.assertEqual(test_card.content.controls[4].value, "教科書 p.20-30")
+
+        teacher_page = FakePage()
+        dashboard.main(teacher_page)
+        picker_controls = teacher_page.controls[0].content.controls
+        picker_controls[3].controls[0].on_click(None)
+        tabs = teacher_page.controls[0].content.controls[2]
+        teacher_test_view = tabs.content.controls[1].controls[3]
+        test_panel = teacher_test_view.controls[0]
+        row = test_panel.content.controls[4].controls[0]
+        subject, date, time, detail = row.content.controls[:4]
+        subject.value = "理科"
+        date.value = "2026-11-13"
+        time.value = "10:00"
+        detail.value = "教科書 p.31-40"
+        publish_button = row.content.controls[4].controls[1]
+        publish_button.on_click(None)
+
+        updated_test = self.store.list_items("tests")[-1]
+        self.assertEqual(updated_test["subject"], "理科")
+        self.assertEqual(updated_test["date"], "2026-11-13")
+        self.assertEqual(updated_test["time"], "10:00")
+        self.assertEqual(updated_test["detail"], "教科書 p.31-40")
+        self.assertTrue(updated_test["published"])
+
+        student_panel = student_page.controls[0].content.controls[2].content.controls[1].controls[4].controls[0]
+        student_panel.content.controls[2].on_click(None)
+        student_panel = student_page.controls[0].content.controls[2].content.controls[1].controls[4].controls[0]
+        cards = student_panel.content.controls[3].controls
+        test_card = cards[0]
+        self.assertEqual(test_card.content.controls[0].value, "理科")
+        self.assertEqual(test_card.content.controls[1].value, "試験日時: 2026-11-13 10:00")
+        self.assertEqual(test_card.content.controls[3].value, "試験範囲")
+        self.assertEqual(test_card.content.controls[4].value, "教科書 p.31-40")
+
+    def test_teacher_can_add_subjects_for_other_grades(self):
+        page = FakePage()
+        dashboard.main(page)
+        picker_controls = page.controls[0].content.controls
+        picker_controls[3].controls[0].on_click(None)
+        tabs = page.controls[0].content.controls[2]
+        test_view = tabs.content.controls[1].controls[3]
+        test_panel = test_view.controls[0]
+        grade_dropdown = test_panel.content.controls[2].controls[0]
+        grade_dropdown.value = "2年生"
+        grade_dropdown.on_select(None)
+
+        tabs = page.controls[0].content.controls[2]
+        test_view = tabs.content.controls[1].controls[3]
+        test_panel = test_view.controls[0]
+        subject_row = test_panel.content.controls[2]
+        subject_row.controls[1].value = "化学"
+        subject_row.controls[2].on_click(None)
+
+        self.assertEqual(self.store.list_test_subjects("2年生"), ["化学"])
+        tabs = page.controls[0].content.controls[2]
+        test_view = tabs.content.controls[1].controls[3]
+        test_rows = test_view.controls[0].content.controls[4]
+        card_fields = test_rows.controls[0].content.controls
+        self.assertEqual(card_fields[0].value, "化学")
+        self.assertEqual(
+            [field.label for field in card_fields[:4]],
+            ["科目", "試験日", "時刻", "範囲"],
+        )
 
 
 if __name__ == "__main__":

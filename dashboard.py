@@ -3,7 +3,7 @@ from datetime import datetime
 
 import flet as ft
 
-from store import PUBLIC_COLLECTIONS, Store
+from store import PUBLIC_COLLECTIONS, TEST_GRADES, Store
 
 
 GREEN = "#2E6654"
@@ -134,6 +134,7 @@ def main(page: ft.Page, require_login=False):
         selected_tab = [0]
         selected_timetable_class = [None]
         selected_timetable_day = ["月"]
+        selected_test_grade = ["1年生"]
         selected_reminder_to_edit = [None]
 
         def refresh(message=None):
@@ -422,6 +423,12 @@ def main(page: ft.Page, require_login=False):
                         )
                         for item in items
                     ]
+                    fields.append(ft.Button(
+                        "最新のテスト予定を表示",
+                        bgcolor=GREEN,
+                        color="white",
+                        on_click=lambda e: render_all("テスト予定を更新しました。"),
+                    ))
                     fields.append(ft.Column(
                         test_cards or [
                             ft.Text("先生から配信されたテストはありません。", color=MUTED)
@@ -429,32 +436,63 @@ def main(page: ft.Page, require_login=False):
                         spacing=10,
                     ))
                     return panel(title, description, fields)
-                column_specs = (
-                    ("科目", 150),
-                    ("試験日", 140),
-                    ("開始時刻", 120),
-                    ("試験範囲", 300),
-                )
                 is_teacher = user["role"] == "teacher"
-
-                def grid_cell(content, width, header=False):
-                    return ft.Container(
-                        content=content,
-                        width=width,
-                        padding=6,
-                        bgcolor=GREEN_LIGHT if header else WHITE,
-                        border=ft.Border.all(1, "#202020"),
+                if is_teacher:
+                    grade_dropdown = ft.Dropdown(
+                        label="学年",
+                        value=selected_test_grade[0],
+                        options=[
+                            ft.dropdown.Option(grade) for grade in TEST_GRADES
+                        ],
+                        width=150,
                     )
 
-                table_rows = [ft.Row([
-                    grid_cell(ft.Text(label, size=12, weight=ft.FontWeight.BOLD), width, True)
-                    for label, width in column_specs
-                ] + [grid_cell(
-                    ft.Text("操作", size=12, weight=ft.FontWeight.BOLD),
-                    250 if is_teacher else 110,
-                    True,
-                )],
-                    spacing=0)]
+                    def select_test_grade(e):
+                        selected_test_grade[0] = grade_dropdown.value
+                        render_all()
+
+                    grade_dropdown.on_select = select_test_grade
+                    subject_to_add = ft.TextField(
+                        label="教科を追加",
+                        hint_text="例: 化学",
+                        width=180,
+                    )
+
+                    def add_test_subject(e):
+                        try:
+                            added = store.add_test_subject(
+                                selected_test_grade[0],
+                                subject_to_add.value or "",
+                            )
+                        except ValueError as error:
+                            fail(str(error))
+                            return
+                        except (OSError, sqlite3.Error) as error:
+                            fail(f"教科を追加できませんでした: {error}")
+                            return
+                        render_all(
+                            "教科を追加しました。" if added else "この教科は登録済みです。"
+                        )
+
+                    fields.append(ft.Row([
+                        grade_dropdown,
+                        subject_to_add,
+                        ft.Button(
+                            "教科を追加",
+                            bgcolor=GREEN,
+                            color="white",
+                            on_click=add_test_subject,
+                        ),
+                    ], wrap=True, spacing=8))
+                    items = [
+                        item for item in items
+                        if item.get("grade", "1年生") == selected_test_grade[0]
+                    ]
+                    test_subjects = store.list_test_subjects(selected_test_grade[0])
+                else:
+                    test_subjects = []
+
+                test_rows = []
                 editable_test_rows = []
 
                 def make_test_fields(item=None):
@@ -463,7 +501,6 @@ def main(page: ft.Page, require_login=False):
                             label="科目",
                             hint_text="例 数学",
                             value=item.get("subject", "") if item else "",
-                            width=138,
                             border_radius=6,
                             border_color="#D4DED5",
                             focused_border_color=GREEN,
@@ -474,7 +511,6 @@ def main(page: ft.Page, require_login=False):
                             label="試験日",
                             hint_text="YYYY-MM-DD",
                             value=item.get("date", "") if item else "",
-                            width=128,
                             border_radius=6,
                             border_color="#D4DED5",
                             focused_border_color=GREEN,
@@ -485,7 +521,6 @@ def main(page: ft.Page, require_login=False):
                             label="時刻",
                             hint_text="HH:MM",
                             value=item.get("time", "") if item else "",
-                            width=108,
                             border_radius=6,
                             border_color="#D4DED5",
                             focused_border_color=GREEN,
@@ -499,12 +534,27 @@ def main(page: ft.Page, require_login=False):
                             multiline=True,
                             min_lines=1,
                             max_lines=3,
-                            width=288,
                         ),
                     )
 
+                def test_editor_card(subject_field, date_field, time_field,
+                                     detail_field, actions):
+                    return ft.Container(
+                        content=ft.Column([
+                            subject_field,
+                            date_field,
+                            time_field,
+                            detail_field,
+                            ft.Row(actions, wrap=True, spacing=8),
+                        ], spacing=8),
+                        padding=14,
+                        bgcolor=WHITE,
+                        border=ft.Border.all(1, "#E3E3D9"),
+                        border_radius=6,
+                    )
+
                 def save_test(e, item_id, subject_field, date_field,
-                              time_field, detail_field):
+                              time_field, detail_field, publish=False):
                     if not is_teacher:
                         fail("テスト予定の編集は先生のみ行えます。")
                         return
@@ -517,17 +567,26 @@ def main(page: ft.Page, require_login=False):
                     try:
                         date_value = datetime.strptime(date_value, "%Y-%m-%d").strftime("%Y-%m-%d")
                         time_value = datetime.strptime(time_value, "%H:%M").strftime("%H:%M")
+                        is_new = item_id is None
                         payload = {
                             "subject": subject_value,
+                            "grade": selected_test_grade[0],
                             "date": date_value,
                             "time": time_value,
                             "detail": (detail_field.value or "").strip(),
                         }
                         if item_id is None:
-                            store.add_item("tests", payload)
-                            render_all("テスト予定を登録しました")
+                            item_id = store.add_item("tests", payload)
                         else:
                             store.update_item("tests", item_id, payload)
+                        if publish and not store.set_test_published(item_id, True):
+                            fail("配信するテストが見つかりません。")
+                            return
+                        if publish:
+                            render_all("テスト予定を保存して生徒へ配信しました。")
+                        elif is_new:
+                            render_all("テスト予定を登録しました")
+                        else:
                             render_all("テスト予定を保存しました")
                     except ValueError:
                         fail("試験日は YYYY-MM-DD、開始時刻は HH:MM 形式で入力してください。")
@@ -546,7 +605,7 @@ def main(page: ft.Page, require_login=False):
                             time_value = (time_field.value or "").strip()
                             detail_value = (detail_field.value or "").strip()
                             if item_id is None and not any(
-                                (subject_value, date_value, time_value, detail_value)
+                                (date_value, time_value, detail_value)
                             ):
                                 continue
                             if not subject_value or not date_value or not time_value:
@@ -556,6 +615,7 @@ def main(page: ft.Page, require_login=False):
                             time_value = datetime.strptime(time_value, "%H:%M").strftime("%H:%M")
                             changes.append((item_id, {
                                 "subject": subject_value,
+                                "grade": selected_test_grade[0],
                                 "date": date_value,
                                 "time": time_value,
                                 "detail": detail_value,
@@ -575,7 +635,7 @@ def main(page: ft.Page, require_login=False):
                     render_all(
                         f"入力内容を保存し、テストを{published_count}件生徒側へ配信しました。"
                         if published_count
-                        else "入力内容を保存しました。配信する未配信のテストはありません。"
+                        else "入力内容を保存し、生徒側のテスト予定に反映しました。"
                     )
 
                 if is_teacher:
@@ -603,6 +663,16 @@ def main(page: ft.Page, require_login=False):
                                     e, item_id, subject, date, time, detail
                                 ),
                             ),
+                            ft.Button(
+                                "保存して生徒へ配信",
+                                bgcolor=GREEN,
+                                color="white",
+                                on_click=lambda e, item_id=item["id"],
+                                subject=subject_field, date=date_field,
+                                time=time_field, detail=detail_field: save_test(
+                                    e, item_id, subject, date, time, detail, True
+                                ),
+                            ),
                             ft.IconButton(
                                 icon=ft.Icons.DELETE_OUTLINE,
                                 icon_color=MUTED,
@@ -612,53 +682,73 @@ def main(page: ft.Page, require_login=False):
                                 ),
                             ),
                         ]
-                        cells = [
-                            grid_cell(subject_field, 150),
-                            grid_cell(date_field, 140),
-                            grid_cell(time_field, 120),
-                            grid_cell(detail_field, 300),
-                        ]
+                        test_rows.append(test_editor_card(
+                            subject_field, date_field, time_field, detail_field,
+                            action_controls,
+                        ))
                     else:
-                        cells = [
-                            grid_cell(ft.Text(item.get(key, ""), size=13), width)
-                            for key, width in (
-                                ("subject", 150), ("date", 140),
-                                ("time", 120), ("detail", 300),
-                            )
-                        ]
-                        action_controls = []
-                    table_rows.append(ft.Row(cells + [
-                        grid_cell(ft.Row(action_controls, spacing=0), 250 if is_teacher else 110),
-                    ], spacing=0))
+                        test_rows.append(ft.Container(
+                            content=ft.Column([
+                                ft.Text(
+                                    item.get("subject", ""),
+                                    size=17,
+                                    color=INK,
+                                    weight=ft.FontWeight.W_600,
+                                ),
+                                ft.Text(
+                                    f"試験日: {item.get('date', '')}",
+                                    size=13,
+                                    color=MUTED,
+                                ),
+                                ft.Text(
+                                    f"開始時刻: {item.get('time', '')}",
+                                    size=13,
+                                    color=MUTED,
+                                ),
+                                ft.Text("試験範囲", size=12, color=MUTED),
+                                ft.Text(
+                                    item.get("detail", "") or "範囲は未登録です。",
+                                    size=14,
+                                    color=INK,
+                                ),
+                            ], spacing=7),
+                            padding=14,
+                            bgcolor=WHITE,
+                            border=ft.Border.all(1, "#E3E3D9"),
+                            border_radius=6,
+                        ))
 
                 if is_teacher:
-                    new_subject, new_date, new_time, new_detail = make_test_fields()
-                    editable_test_rows.append((
-                        None, new_subject, new_date, new_time, new_detail,
-                    ))
-                    table_rows.append(ft.Row([
-                        grid_cell(new_subject, 150),
-                        grid_cell(new_date, 140),
-                        grid_cell(new_time, 120),
-                        grid_cell(new_detail, 300),
-                        grid_cell(ft.Button(
-                            "登録（未配信）",
-                            bgcolor=GREEN,
-                            color="white",
-                            on_click=lambda e: save_test(
-                                e, None, new_subject, new_date, new_time, new_detail
-                            ),
-                        ), 250),
-                    ], spacing=0))
+                    existing_subjects = {item.get("subject", "") for item in items}
+                    for preset_subject in test_subjects:
+                        if preset_subject in existing_subjects:
+                            continue
+                        new_subject, new_date, new_time, new_detail = make_test_fields()
+                        new_subject.value = preset_subject
+                        editable_test_rows.append((
+                            None, new_subject, new_date, new_time, new_detail,
+                        ))
+                        test_rows.append(test_editor_card(
+                            new_subject, new_date, new_time, new_detail,
+                            [ft.Button(
+                                "保存して生徒へ配信",
+                                bgcolor=GREEN,
+                                color="white",
+                                on_click=lambda e, subject=new_subject,
+                                date=new_date, time=new_time, detail=new_detail: save_test(
+                                    e, None, subject, date, time, detail, True
+                                ),
+                            )],
+                        ))
+                    if not test_subjects and not items:
+                        test_rows.append(
+                            ft.Text("この学年の教科を上から追加してください。", color=MUTED)
+                        )
                 elif not items:
-                    table_rows.append(ft.Row([
-                        grid_cell(ft.Text("先生から配信されたテストはありません。", color=MUTED), 710),
-                        grid_cell(ft.Text(""), 110),
-                    ], spacing=0))
-                fields.append(ft.Column(
-                    [ft.Row(table_rows, spacing=0, scroll=ft.ScrollMode.AUTO)],
-                    scroll=ft.ScrollMode.AUTO,
-                ))
+                    test_rows.append(ft.Text(
+                        "先生から配信されたテストはありません。", color=MUTED
+                    ))
+                fields.append(ft.Column(test_rows, spacing=10))
             else:
                 rows = [
                     row(
@@ -1207,7 +1297,8 @@ def main(page: ft.Page, require_login=False):
         def tests_view():
             return items_panel(
                 "tests", "テスト管理",
-                "時間割表のように入力・編集できます。先生は「配信」すると生徒側に表示されます。"
+                "学年を選び、教科ごとに試験日・開始時刻・範囲を入力できます。"
+                "教科を追加して2・3年生の表も作成できます。配信したテストは生徒側に表示されます。"
                 if user["role"] == "teacher"
                 else "先生から配信されたテスト予定を確認できます。",
             )
