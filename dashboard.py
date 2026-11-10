@@ -1,5 +1,7 @@
 import sqlite3
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timedelta
 
 import flet as ft
 
@@ -51,6 +53,8 @@ def main(page: ft.Page, require_login=False):
     page.on_resize = lambda e: resize_page()
 
     def show_role_picker():
+        page._student_auto_refresh_active = False
+
         def enter_role(role):
             try:
                 user = store.get_development_user(role)
@@ -90,6 +94,8 @@ def main(page: ft.Page, require_login=False):
         page.update()
 
     def show_login(message=""):
+        page._student_auto_refresh_active = False
+
         username = text_field("ユーザー名", "ユーザー名")
         password = text_field("パスワード", "パスワード", password=True)
         status = ft.Text(message, color=MUTED, size=12)
@@ -335,20 +341,40 @@ def main(page: ft.Page, require_login=False):
                 )
                 detail_display = lambda item: item.get("detail", "")
             elif collection == "assignments":
-                assignment_title = text_field("課題名", "レポート・宿題")
-                due = text_field("提出期限", "YYYY-MM-DD")
-                detail = text_field("提出先・メモ", "提出方法など")
-                inputs = [assignment_title, due, detail]
+                assignment_subject = text_field("科目", "例: 数学")
+                assignment_content = ft.TextField(
+                    label="提出内容",
+                    hint_text="課題の内容や提出するものを入力",
+                    multiline=True,
+                    min_lines=2,
+                    max_lines=4,
+                    expand=True,
+                )
+                due = text_field("提出日", "YYYY-MM-DD")
+                destination = text_field("提出先", "例: 教室で先生に提出")
+                inputs = [assignment_subject, assignment_content, due, destination]
 
                 def add(e):
-                    if assignment_title.value and assignment_title.value.strip() and due.value and due.value.strip():
-                        add_item(collection, {"title": assignment_title.value.strip(),
-                                              "due": due.value.strip(),
-                                              "detail": (detail.value or "").strip()},
-                                 "課題を登録しました")
-
-                title_display = lambda item: f"{item['title']}  {item['due']}"
-                detail_display = lambda item: item.get("detail", "")
+                    subject_value = (assignment_subject.value or "").strip()
+                    content_value = (assignment_content.value or "").strip()
+                    due_value = (due.value or "").strip()
+                    destination_value = (destination.value or "").strip()
+                    if not subject_value or not content_value or not due_value or not destination_value:
+                        fail("科目・提出内容・提出日・提出先を入力してください。")
+                        return
+                    try:
+                        due_value = datetime.strptime(
+                            due_value, "%Y-%m-%d"
+                        ).strftime("%Y-%m-%d")
+                    except ValueError:
+                        fail("提出日は YYYY-MM-DD 形式で入力してください。")
+                        return
+                    add_item(collection, {
+                        "subject": subject_value,
+                        "content": content_value,
+                        "due": due_value,
+                        "destination": destination_value,
+                    }, "課題を登録しました")
             else:
                 date = text_field("日付", "YYYY-MM-DD")
                 event_title = text_field("行事・予定", "例 体育祭、保護者会")
@@ -388,11 +414,17 @@ def main(page: ft.Page, require_login=False):
                     item.get("date", ""),
                     item.get("time", ""),
                 ))
+            if collection == "assignments":
+                items.sort(key=lambda item: item.get("due", ""))
             if collection == "reminders":
                 items.sort(key=lambda item: item.get("when", ""))
             if collection == "tests":
                 if user["role"] == "student":
                     items = [item for item in items if item.get("published", False)]
+                    items = [
+                        item for item in items
+                        if item.get("grade", "1年生") == selected_test_grade[0]
+                    ]
                     test_cards = [
                         ft.Container(
                             content=ft.Column([
@@ -423,6 +455,21 @@ def main(page: ft.Page, require_login=False):
                         )
                         for item in items
                     ]
+                    grade_dropdown = ft.Dropdown(
+                        label="学年",
+                        value=selected_test_grade[0],
+                        options=[
+                            ft.dropdown.Option(grade) for grade in TEST_GRADES
+                        ],
+                        width=150,
+                    )
+
+                    def select_student_test_grade(e):
+                        selected_test_grade[0] = grade_dropdown.value
+                        render_all()
+
+                    grade_dropdown.on_select = select_student_test_grade
+                    fields.append(grade_dropdown)
                     fields.append(ft.Button(
                         "最新のテスト予定を表示",
                         bgcolor=GREEN,
@@ -749,6 +796,97 @@ def main(page: ft.Page, require_login=False):
                         "先生から配信されたテストはありません。", color=MUTED
                     ))
                 fields.append(ft.Column(test_rows, spacing=10))
+            elif collection == "assignments":
+                def update_assignment_submission(e, assignment_id, student_id):
+                    if user["role"] != "teacher":
+                        fail("提出状況を変更できるのは先生のみです。")
+                        return
+                    try:
+                        store.set_assignment_submitted(
+                            assignment_id,
+                            student_id,
+                            e.control.value == "submitted",
+                        )
+                    except (ValueError, OSError, sqlite3.Error) as error:
+                        fail(f"提出状況を保存できませんでした: {error}")
+                        return
+                    render_all("提出状況を更新しました。")
+
+                assignment_cards = []
+                for item in items:
+                    assignment_id = item["id"]
+                    subject = item.get("subject") or item.get("title", "")
+                    destination_value = item.get("destination") or item.get("detail", "")
+                    card_controls = [
+                        ft.Text(
+                            f"{subject}　提出日: {item.get('due', '')}",
+                            size=16,
+                            color=INK,
+                            weight=ft.FontWeight.W_600,
+                        ),
+                        ft.Text(
+                            f"提出先: {destination_value}",
+                            size=13,
+                            color=MUTED,
+                        ),
+                        ft.Text(
+                            f"提出内容: {item.get('content') or '内容は未登録です。'}",
+                            size=13,
+                            color=INK,
+                        ),
+                    ]
+                    if user["role"] == "student":
+                        submitted = store.assignment_submitted(assignment_id, user["id"])
+                        card_controls.append(ft.Text(
+                            f"提出状況: {'提出済み' if submitted else '未提出'}",
+                            size=13,
+                            color=GREEN if submitted else MUTED,
+                        ))
+                    else:
+                        submission_rows = []
+                        for submission in store.list_assignment_submission_statuses(assignment_id):
+                            status_dropdown = ft.Dropdown(
+                                value="submitted" if submission["submitted"] else "pending",
+                                options=[
+                                    ft.dropdown.Option("pending", "未提出"),
+                                    ft.dropdown.Option("submitted", "提出済み"),
+                                ],
+                                width=140,
+                                on_select=lambda e, aid=assignment_id,
+                                sid=submission["student_id"]: update_assignment_submission(
+                                    e, aid, sid
+                                ),
+                            )
+                            submission_rows.append(ft.Row([
+                                ft.Text(
+                                    f"{submission['username']} "
+                                    f"({submission.get('class_name') or 'クラス未設定'})",
+                                    expand=True,
+                                    size=13,
+                                    color=INK,
+                                ),
+                                status_dropdown,
+                            ]))
+                        card_controls.append(ft.Text("生徒ごとの提出状況", size=12, color=MUTED))
+                        card_controls.append(ft.Column(
+                            submission_rows or [
+                                ft.Text("生徒アカウントはまだありません。", size=13, color=MUTED)
+                            ],
+                            spacing=4,
+                        ))
+                    assignment_cards.append(ft.Container(
+                        content=ft.Column(card_controls, spacing=7),
+                        padding=14,
+                        bgcolor=WHITE,
+                        border=ft.Border.all(1, "#E3E3D9"),
+                        border_radius=6,
+                    ))
+                fields.append(ft.Column(
+                    assignment_cards or [
+                        ft.Text("登録された課題はありません。", color=MUTED, size=13)
+                    ],
+                    spacing=10,
+                ))
             else:
                 rows = [
                     row(
@@ -1447,6 +1585,24 @@ def main(page: ft.Page, require_login=False):
             ])
 
         def render_all(message=None):
+            if user["role"] == "student":
+                if not getattr(page, "_student_auto_refresh_active", False):
+                    page._student_auto_refresh_active = True
+
+                    def auto_refresh_tests():
+                        while getattr(page, "_student_auto_refresh_active", False):
+                            time.sleep(15)
+                            if user["role"] != "student" or not page.controls:
+                                continue
+                            try:
+                                page.run_thread(lambda: render_all())
+                            except Exception:
+                                pass
+
+                    threading.Thread(target=auto_refresh_tests, daemon=True).start()
+            else:
+                page._student_auto_refresh_active = False
+
             teacher = user["role"] == "teacher"
             tab_labels = ["ホーム", "時間割", "通知", "テスト", "課題", "カレンダー", "チャット"]
             views = [home_view(), timetable_view(), reminders_view(), tests_view(),
@@ -1482,10 +1638,42 @@ def main(page: ft.Page, require_login=False):
                     )),
                 ], spacing=4),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-            heading = ft.Column([
+            heading_controls = [
                 ft.Text("学生ダッシュボード", size=34, color=INK, weight=ft.FontWeight.W_600),
                 ft.Text("予定・締切・共有を、ひとつの場所で。", size=13, color=MUTED),
-            ], spacing=4)
+            ]
+            if user["role"] == "student":
+                tomorrow = (datetime.now().date() + timedelta(days=1)).isoformat()
+                due_notices = []
+                for assignment in store.list_items("assignments"):
+                    if (
+                        assignment.get("due") == tomorrow
+                        and not store.assignment_submitted(assignment["id"], user["id"])
+                    ):
+                        due_notices.append(ft.Text(
+                            f"{assignment.get('subject') or assignment.get('title', '')}: "
+                            f"明日が提出日です（提出先: "
+                            f"{assignment.get('destination') or assignment.get('detail', '')}）",
+                            size=13,
+                            color="#8F3B2E",
+                        ))
+                if due_notices:
+                    heading_controls.append(ft.Container(
+                        content=ft.Column([
+                            ft.Text(
+                                "未提出の課題があります",
+                                size=14,
+                                color="#8F3B2E",
+                                weight=ft.FontWeight.W_600,
+                            ),
+                            *due_notices,
+                        ], spacing=5),
+                        padding=12,
+                        bgcolor="#FFF1E8",
+                        border=ft.Border.all(1, "#F1C7B8"),
+                        border_radius=6,
+                    ))
+            heading = ft.Column(heading_controls, spacing=4)
             content = ft.Column([header, heading, tabs, status], width=700, spacing=22)
             page.controls.clear()
             page.add(ft.Container(

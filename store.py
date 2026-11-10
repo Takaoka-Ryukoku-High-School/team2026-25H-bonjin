@@ -69,6 +69,12 @@ class Store:
                     date TEXT PRIMARY KEY,
                     payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS assignment_submissions (
+                    assignment_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    student_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    submitted INTEGER NOT NULL DEFAULT 0 CHECK (submitted IN (0, 1)),
+                    PRIMARY KEY (assignment_id, student_id)
+                );
                 """
             )
         os.chmod(self.path, 0o600)
@@ -209,6 +215,58 @@ class Store:
                 """SELECT users.id, users.username, classes.name AS class_name
                    FROM users LEFT JOIN classes ON classes.id = users.class_id
                    WHERE users.role = 'student' ORDER BY users.username"""
+            )]
+
+    def set_assignment_submitted(self, assignment_id, student_id, submitted):
+        with self._connect() as connection:
+            assignment = connection.execute(
+                "SELECT 1 FROM items WHERE id = ? AND collection = 'assignments'",
+                (assignment_id,),
+            ).fetchone()
+            if assignment is None:
+                raise ValueError("課題が見つかりません。")
+            student = connection.execute(
+                "SELECT 1 FROM users WHERE id = ? AND role = 'student'",
+                (student_id,),
+            ).fetchone()
+            if student is None:
+                raise ValueError("生徒が見つかりません。")
+            connection.execute(
+                """INSERT INTO assignment_submissions (assignment_id, student_id, submitted)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(assignment_id, student_id)
+                   DO UPDATE SET submitted = excluded.submitted""",
+                (assignment_id, student_id, int(bool(submitted))),
+            )
+
+    def assignment_submitted(self, assignment_id, student_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT submitted FROM assignment_submissions
+                   WHERE assignment_id = ? AND student_id = ?""",
+                (assignment_id, student_id),
+            ).fetchone()
+            return bool(row["submitted"]) if row else False
+
+    def list_assignment_submission_statuses(self, assignment_id):
+        with self._connect() as connection:
+            assignment = connection.execute(
+                "SELECT 1 FROM items WHERE id = ? AND collection = 'assignments'",
+                (assignment_id,),
+            ).fetchone()
+            if assignment is None:
+                raise ValueError("課題が見つかりません。")
+            return [dict(row) for row in connection.execute(
+                """SELECT users.id AS student_id, users.username, classes.name AS class_name,
+                          COALESCE(assignment_submissions.submitted, 0) AS submitted
+                   FROM users
+                   LEFT JOIN classes ON classes.id = users.class_id
+                   LEFT JOIN assignment_submissions
+                     ON assignment_submissions.student_id = users.id
+                    AND assignment_submissions.assignment_id = ?
+                   WHERE users.role = 'student'
+                   ORDER BY users.username""",
+                (assignment_id,),
             )]
 
     def list_items(self, collection, owner_id=None):

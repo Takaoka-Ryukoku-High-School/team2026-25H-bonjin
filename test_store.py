@@ -44,6 +44,34 @@ class StoreTests(unittest.TestCase):
                          ["second task"])
         self.assertEqual(len(self.store.list_items("timetable")), 1)
 
+    def test_assignment_submission_status_is_tracked_per_student(self):
+        class_id = self.store.create_class("1年A組")
+        first_id = self.store.create_student("student-a", "password-a", class_id)
+        second_id = self.store.create_student("student-b", "password-b", class_id)
+        assignment_id = self.store.add_item("assignments", {
+            "subject": "数学",
+            "due": "2026-11-20",
+            "destination": "数学科教員室",
+        })
+
+        self.assertFalse(self.store.assignment_submitted(assignment_id, first_id))
+        self.store.set_assignment_submitted(assignment_id, first_id, True)
+
+        self.assertTrue(self.store.assignment_submitted(assignment_id, first_id))
+        self.assertFalse(self.store.assignment_submitted(assignment_id, second_id))
+        statuses = self.store.list_assignment_submission_statuses(assignment_id)
+        self.assertEqual(
+            [(status["username"], bool(status["submitted"])) for status in statuses],
+            [("student-a", True), ("student-b", False)],
+        )
+
+        self.store.delete_item("assignments", assignment_id)
+        with self.store._connect() as connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM assignment_submissions"
+            ).fetchone()[0]
+        self.assertEqual(remaining, 0)
+
     def test_weekday_timetable_can_be_updated_by_day_and_period(self):
         lesson = {"day": "月", "period": "1", "time": "09:00-10:30",
                   "subject": "数学", "teacher": "山田先生"}

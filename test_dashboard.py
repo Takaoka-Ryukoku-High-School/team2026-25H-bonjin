@@ -1,6 +1,8 @@
+from datetime import date, timedelta
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import dashboard
@@ -104,10 +106,10 @@ class DashboardTests(unittest.TestCase):
         tabs = student_page.controls[0].content.controls[2]
         student_test_view = tabs.content.controls[1].controls[4]
         student_panel = student_test_view.controls[0]
-        refresh_button = student_panel.content.controls[2]
+        refresh_button = student_panel.content.controls[3]
         refresh_button.on_click(None)
         student_panel = student_page.controls[0].content.controls[2].content.controls[1].controls[4].controls[0]
-        cards = student_panel.content.controls[3].controls
+        cards = student_panel.content.controls[4].controls
         test_card = cards[0]
         self.assertEqual(test_card.content.controls[0].value, "理科")
         self.assertEqual(test_card.content.controls[1].value, "試験日時: 2026-11-12 09:00")
@@ -137,14 +139,132 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(updated_test["published"])
 
         student_panel = student_page.controls[0].content.controls[2].content.controls[1].controls[4].controls[0]
-        student_panel.content.controls[2].on_click(None)
+        student_panel.content.controls[3].on_click(None)
         student_panel = student_page.controls[0].content.controls[2].content.controls[1].controls[4].controls[0]
-        cards = student_panel.content.controls[3].controls
+        cards = student_panel.content.controls[4].controls
         test_card = cards[0]
         self.assertEqual(test_card.content.controls[0].value, "理科")
         self.assertEqual(test_card.content.controls[1].value, "試験日時: 2026-11-13 10:00")
         self.assertEqual(test_card.content.controls[3].value, "試験範囲")
         self.assertEqual(test_card.content.controls[4].value, "教科書 p.31-40")
+
+    def test_student_can_select_test_grade(self):
+        self.store.add_item("tests", {
+            "grade": "1年生", "subject": "数学", "date": "2026-11-12",
+            "time": "09:00", "detail": "一次関数", "published": True,
+        })
+        self.store.add_item("tests", {
+            "grade": "2年生", "subject": "化学", "date": "2026-11-13",
+            "time": "10:00", "detail": "酸化還元", "published": True,
+        })
+        self.store.add_item("tests", {
+            "grade": "2年生", "subject": "物理", "date": "2026-11-14",
+            "time": "11:00", "detail": "力学", "published": False,
+        })
+
+        page = FakePage()
+        dashboard.main(page)
+        picker_controls = page.controls[0].content.controls
+        picker_controls[3].controls[1].on_click(None)
+
+        student_panel = page.controls[0].content.controls[2].content.controls[1].controls[4].controls[0]
+        grade_dropdown = student_panel.content.controls[2]
+        self.assertEqual(grade_dropdown.value, "1年生")
+        self.assertEqual(
+            [option.key for option in grade_dropdown.options],
+            ["1年生", "2年生", "3年生"],
+        )
+        self.assertEqual(
+            student_panel.content.controls[4].controls[0].content.controls[0].value,
+            "数学",
+        )
+
+        grade_dropdown.value = "2年生"
+        grade_dropdown.on_select(None)
+
+        student_panel = page.controls[0].content.controls[2].content.controls[1].controls[4].controls[0]
+        self.assertEqual(student_panel.content.controls[2].value, "2年生")
+        cards = student_panel.content.controls[4].controls
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].content.controls[0].value, "化学")
+
+    def test_student_dashboard_starts_automatic_test_refresh(self):
+        page = FakePage()
+        dashboard.main(page)
+        picker_controls = page.controls[0].content.controls
+        picker_controls[3].controls[1].on_click(None)
+
+        self.assertTrue(getattr(page, "_student_auto_refresh_active", False))
+
+    def test_assignment_management_tracks_status_and_shows_due_notice(self):
+        student_user = self.store.get_development_user("student")
+        due_date = (date.today() + timedelta(days=1)).isoformat()
+
+        teacher_page = FakePage()
+        dashboard.main(teacher_page)
+        picker_controls = teacher_page.controls[0].content.controls
+        picker_controls[3].controls[0].on_click(None)
+        assignment_view = teacher_page.controls[0].content.controls[2].content.controls[1].controls[4]
+        assignment_panel = assignment_view.controls[0]
+        assignment_form = assignment_panel.content.controls[2]
+        fields = assignment_form.content.controls
+        fields[0].value = "数学"
+        fields[1].value = "教科書 p.20-30 の問題を解く"
+        fields[2].value = due_date
+        fields[3].value = "数学科教員室"
+        fields[4].on_click(None)
+        assignment_id = self.store.list_items("assignments")[0]["id"]
+        self.assertEqual(
+            self.store.list_items("assignments")[0]["content"],
+            "教科書 p.20-30 の問題を解く",
+        )
+
+        assignment_view = teacher_page.controls[0].content.controls[2].content.controls[1].controls[4]
+        assignment_panel = assignment_view.controls[0]
+        assignment_card = assignment_panel.content.controls[3].controls[0]
+        self.assertEqual(
+            assignment_card.content.controls[2].value,
+            "提出内容: 教科書 p.20-30 の問題を解く",
+        )
+        submission_rows = assignment_card.content.controls[4].controls
+        student_row = next(
+            row for row in submission_rows
+            if student_user["username"] in row.controls[0].value
+        )
+        status_dropdown = student_row.controls[1]
+        status_dropdown.value = "submitted"
+        status_dropdown.on_select(SimpleNamespace(control=status_dropdown))
+
+        self.assertTrue(self.store.assignment_submitted(
+            assignment_id, student_user["id"]
+        ))
+
+        student_page = FakePage()
+        dashboard.main(student_page)
+        picker_controls = student_page.controls[0].content.controls
+        picker_controls[3].controls[1].on_click(None)
+        assignment_view = student_page.controls[0].content.controls[2].content.controls[1].controls[5]
+        assignment_card = assignment_view.controls[0].content.controls[2].controls[0]
+        self.assertEqual(
+            assignment_card.content.controls[2].value,
+            "提出内容: 教科書 p.20-30 の問題を解く",
+        )
+        self.assertEqual(assignment_card.content.controls[3].value, "提出状況: 提出済み")
+        self.assertEqual(len(assignment_view.controls[0].content.controls[2].controls), 1)
+        self.assertEqual(
+            len(student_page.controls[0].content.controls[1].controls), 2
+        )
+
+        self.store.set_assignment_submitted(
+            assignment_id, student_user["id"], False
+        )
+        dashboard.main(student_page)
+        picker_controls = student_page.controls[0].content.controls
+        picker_controls[3].controls[1].on_click(None)
+        heading = student_page.controls[0].content.controls[1]
+        notice = heading.controls[2]
+        self.assertEqual(notice.content.controls[0].value, "未提出の課題があります")
+        self.assertIn("明日が提出日です", notice.content.controls[1].value)
 
     def test_teacher_can_add_subjects_for_other_grades(self):
         page = FakePage()
