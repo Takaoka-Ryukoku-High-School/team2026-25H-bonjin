@@ -271,7 +271,12 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(self.store.can_access_conversation(student, f"class:{second_class}"))
 
         self.store.send_message(student, direct_chat, "こんにちは")
-        self.assertEqual(self.store.list_messages(direct_chat)[0]["body"], "こんにちは")
+        self.store.send_message(teacher, direct_chat, "先生からの返信です")
+        messages = self.store.list_messages(direct_chat)
+        self.assertEqual([message["body"] for message in messages],
+                         ["こんにちは", "先生からの返信です"])
+        self.assertEqual([message["sender_id"] for message in messages],
+                         [first_student_id, teacher_id])
         with self.assertRaises(PermissionError):
             self.store.send_message(stranger, direct_chat, "見えないはず")
 

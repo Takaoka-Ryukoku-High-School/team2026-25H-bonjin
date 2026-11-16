@@ -26,7 +26,7 @@ PERIOD_TIMES = {
 }
 
 
-def text_field(label, hint, expand=True, width=None, password=False):
+def text_field(label, hint, expand=True, width=None, password=False, on_submit=None):
     return ft.TextField(
         label=label,
         hint_text=hint,
@@ -34,6 +34,7 @@ def text_field(label, hint, expand=True, width=None, password=False):
         width=width,
         password=password,
         can_reveal_password=password,
+        on_submit=on_submit,
         border_radius=6,
         border_color="#D4DED5",
         focused_border_color=GREEN,
@@ -53,10 +54,14 @@ def main(page: ft.Page, require_login=False):
     page.on_resize = lambda e: resize_page()
 
     def show_role_picker():
+        page._dashboard_auto_refresh_active = False
         page._student_auto_refresh_active = False
+        page._teacher_auto_refresh_active = False
 
         def enter_role(role):
             try:
+                store.get_development_user("teacher")
+                store.get_development_user("student")
                 user = store.get_development_user(role)
             except (OSError, sqlite3.Error, ValueError) as error:
                 page.controls.clear()
@@ -94,7 +99,9 @@ def main(page: ft.Page, require_login=False):
         page.update()
 
     def show_login(message=""):
+        page._dashboard_auto_refresh_active = False
         page._student_auto_refresh_active = False
+        page._teacher_auto_refresh_active = False
 
         username = text_field("ユーザー名", "ユーザー名")
         password = text_field("パスワード", "パスワード", password=True)
@@ -1535,31 +1542,94 @@ def main(page: ft.Page, require_login=False):
                 value=selected_conversation[0],
                 on_select=lambda e: select_conversation(e.control.value),
             )
-            message = text_field("メッセージ", "メッセージを入力")
+            message = ft.TextField(
+                label="メッセージ",
+                hint_text="メッセージを入力",
+                expand=True,
+                min_lines=1,
+                max_lines=3,
+                multiline=True,
+                border_radius=18,
+                border_color="#D4DED5",
+                focused_border_color=GREEN,
+                bgcolor=WHITE,
+                content_padding=ft.Padding.only(left=16, right=16, top=12, bottom=12),
+                text_size=14,
+            )
+
+            def send_button_label(conversation_id):
+                contact = next(
+                    contact for contact in contacts
+                    if contact["conversation_id"] == conversation_id
+                )
+                recipient = contact["label"].split(": ", 1)[-1]
+                return f"{recipient}へ送信"
 
             def messages_view():
                 conversation_id = selected_conversation[0]
                 if not store.can_access_conversation(user, conversation_id):
                     return [ft.Text("このチャットには参加できません。", color=MUTED, size=13)]
                 entries = store.list_messages(conversation_id)
-                return [
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text(f"{entry['sender']}  ({entry['created_at']})",
-                                    size=12, color=MUTED),
-                            ft.Text(entry["body"], size=14, color=INK),
-                        ], spacing=3),
-                        padding=10,
-                        border=ft.Border.only(bottom=ft.BorderSide(1, "#DEDFD5")),
-                    )
-                    for entry in entries
-                ] or [ft.Text("メッセージはまだありません。", color=MUTED, size=13)]
+                if not entries:
+                    return [ft.Text("メッセージはまだありません。", color=MUTED, size=13)]
 
-            message_list = ft.Column(messages_view(), spacing=0)
+                rows = []
+                for entry in entries:
+                    is_me = entry["sender"] == user["username"]
+                    bubble = ft.Container(
+                        content=ft.Column([
+                            ft.Text(entry["body"], size=14, selectable=True,
+                                    color="white" if is_me else INK,
+                                    weight=ft.FontWeight.W_500,
+                                    max_lines=10,
+                                    overflow=ft.TextOverflow.VISIBLE),
+                            ft.Text(
+                                entry["created_at"],
+                                size=10,
+                                color=("#DBF5E5" if is_me else MUTED),
+                                text_align=ft.TextAlign.RIGHT,
+                            ),
+                        ], tight=True, spacing=4),
+                        padding=ft.Padding.only(left=14, top=10, right=14, bottom=8),
+                        bgcolor=GREEN if is_me else WHITE,
+                        border_radius=18,
+                        shadow=ft.BoxShadow(
+                            spread_radius=0,
+                            blur_radius=6,
+                            color="#DDE5DF",
+                            offset=ft.Offset(0, 2),
+                        ) if not is_me else None,
+                        width=360,
+                    )
+                    row = ft.Row(
+                        [
+                            ft.Container(width=60 if not is_me else 0),
+                            bubble,
+                            ft.Container(width=60 if is_me else 0),
+                        ],
+                        alignment=ft.MainAxisAlignment.START if not is_me else ft.MainAxisAlignment.END,
+                        spacing=0,
+                    )
+                    if is_me:
+                        row.controls = [ft.Container(width=60), bubble]
+                    else:
+                        row.controls = [bubble, ft.Container(width=60)]
+                    rows.append(row)
+                return rows
+
+            message_list = ft.Column(messages_view(), spacing=8, scroll=ft.ScrollMode.AUTO)
+            send_button = ft.Button(
+                send_button_label(selected_conversation[0]),
+                bgcolor=GREEN,
+                color="white",
+                height=54,
+                on_click=lambda e: None,
+            )
 
             def select_conversation(value):
                 if value and store.can_access_conversation(user, value):
                     selected_conversation[0] = value
+                    send_button.text = send_button_label(value)
                     message_list.controls = messages_view()
                     page.update()
 
@@ -1578,30 +1648,52 @@ def main(page: ft.Page, require_login=False):
                 message.value = ""
                 render_all("メッセージを送信しました")
 
-            return panel("チャット", "先生と生徒の個人チャット、クラス別グループチャットです。", [
+            send_button.on_click = send
+            message.on_submit = send
+
+            return panel("チャット", "相手を選び、メッセージを入力して送信します。", [
                 conversation,
-                form([message], "送信", send),
-                message_list,
+                ft.Container(
+                    content=ft.Row([
+                        message,
+                        ft.Container(
+                            content=send_button,
+                            alignment=ft.Alignment(0.5, 0.5),
+                            width=150,
+                        ),
+                    ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.END),
+                    padding=12,
+                    bgcolor=GREEN_LIGHT,
+                    border_radius=18,
+                ),
+                ft.Container(
+                    content=message_list,
+                    height=420,
+                    padding=12,
+                    bgcolor="#F3F4F0",
+                    border_radius=18,
+                    border=ft.Border.all(1, "#E2E7E0"),
+                ),
             ])
 
         def render_all(message=None):
-            if user["role"] == "student":
-                if not getattr(page, "_student_auto_refresh_active", False):
-                    page._student_auto_refresh_active = True
+            teacher = user["role"] == "teacher"
+            page._student_auto_refresh_active = not teacher
+            page._teacher_auto_refresh_active = teacher
+            if not getattr(page, "_dashboard_auto_refresh_active", False):
+                page._dashboard_auto_refresh_active = True
 
-                    def auto_refresh_tests():
-                        while getattr(page, "_student_auto_refresh_active", False):
-                            time.sleep(15)
-                            if user["role"] != "student" or not page.controls:
-                                continue
-                            try:
-                                page.run_thread(lambda: render_all())
-                            except Exception:
-                                pass
+                def auto_refresh_dashboard():
+                    while getattr(page, "_dashboard_auto_refresh_active", False):
+                        time.sleep(15)
+                        if not page.controls:
+                            continue
+                        try:
+                            page.run_thread(lambda: render_all())
+                        except Exception:
+                            pass
 
-                    threading.Thread(target=auto_refresh_tests, daemon=True).start()
-            else:
-                page._student_auto_refresh_active = False
+                threading.Thread(target=auto_refresh_dashboard, daemon=True).start()
 
             teacher = user["role"] == "teacher"
             tab_labels = ["ホーム", "時間割", "通知", "テスト", "課題", "カレンダー", "チャット"]
