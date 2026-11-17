@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -42,7 +43,8 @@ class Store:
                 );
                 CREATE TABLE IF NOT EXISTS classes (
                     id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    grade TEXT
                 );
                 CREATE TABLE IF NOT EXISTS items (
                     id INTEGER PRIMARY KEY,
@@ -77,6 +79,7 @@ class Store:
                 );
                 """
             )
+        self._migrate_class_grades()
         os.chmod(self.path, 0o600)
         self._migrate_legacy_data()
         self._migrate_test_publication_state()
@@ -109,6 +112,28 @@ class Store:
                         "UPDATE items SET payload = ? WHERE id = ?",
                         (json.dumps(payload, ensure_ascii=False), row["id"]),
                     )
+
+    def _migrate_class_grades(self):
+        with self._connect() as connection:
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(classes)")
+            }
+            if "grade" not in columns:
+                connection.execute("ALTER TABLE classes ADD COLUMN grade TEXT")
+            for row in connection.execute(
+                "SELECT id, name FROM classes WHERE grade IS NULL"
+            ).fetchall():
+                grade = self._grade_from_class_name(row["name"])
+                if grade:
+                    connection.execute(
+                        "UPDATE classes SET grade = ? WHERE id = ?",
+                        (grade, row["id"]),
+                    )
+
+    @staticmethod
+    def _grade_from_class_name(name):
+        match = re.match(r"^\s*([1-3])\s*年", name)
+        return f"{match.group(1)}年生" if match else None
 
     def create_user(self, username, password, role, class_id=None):
         username = username.strip()
@@ -187,18 +212,25 @@ class Store:
             )
             return {"id": user_id, "username": username, "role": role, "class_id": class_id}
 
-    def create_class(self, name):
+    def create_class(self, name, grade=None):
         name = name.strip()
         if not name:
             raise ValueError("クラス名を入力してください。")
+        if grade is not None and grade not in TEST_GRADES:
+            raise ValueError("学年を選択してください。")
+        if grade is None:
+            grade = self._grade_from_class_name(name)
         with self._connect() as connection:
-            cursor = connection.execute("INSERT INTO classes (name) VALUES (?)", (name,))
+            cursor = connection.execute(
+                "INSERT INTO classes (name, grade) VALUES (?, ?)",
+                (name, grade),
+            )
             return cursor.lastrowid
 
     def list_classes(self):
         with self._connect() as connection:
             return [dict(row) for row in connection.execute(
-                "SELECT id, name FROM classes ORDER BY name"
+                "SELECT id, name, grade FROM classes ORDER BY name"
             )]
 
     def create_student(self, username, password, class_id):
@@ -251,22 +283,35 @@ class Store:
     def list_assignment_submission_statuses(self, assignment_id):
         with self._connect() as connection:
             assignment = connection.execute(
-                "SELECT 1 FROM items WHERE id = ? AND collection = 'assignments'",
+                "SELECT payload FROM items WHERE id = ? AND collection = 'assignments'",
                 (assignment_id,),
             ).fetchone()
             if assignment is None:
                 raise ValueError("課題が見つかりません。")
+            payload = json.loads(assignment["payload"])
+            target_type = payload.get("target_type", "all")
+            if target_type == "class":
+                target_filter = "AND users.class_id = ?"
+                target_parameters = (payload.get("target_class_id"),)
+            elif target_type == "grade":
+                target_filter = "AND classes.grade = ?"
+                target_parameters = (payload.get("target_grade"),)
+            else:
+                target_filter = ""
+                target_parameters = ()
+            query = f"""SELECT users.id AS student_id, users.username, classes.name AS class_name,
+                               COALESCE(assignment_submissions.submitted, 0) AS submitted
+                        FROM users
+                        LEFT JOIN classes ON classes.id = users.class_id
+                        LEFT JOIN assignment_submissions
+                          ON assignment_submissions.student_id = users.id
+                         AND assignment_submissions.assignment_id = ?
+                        WHERE users.role = 'student' {target_filter}
+                        ORDER BY users.username"""
+            params = (assignment_id, *target_parameters)
             return [dict(row) for row in connection.execute(
-                """SELECT users.id AS student_id, users.username, classes.name AS class_name,
-                          COALESCE(assignment_submissions.submitted, 0) AS submitted
-                   FROM users
-                   LEFT JOIN classes ON classes.id = users.class_id
-                   LEFT JOIN assignment_submissions
-                     ON assignment_submissions.student_id = users.id
-                    AND assignment_submissions.assignment_id = ?
-                   WHERE users.role = 'student'
-                   ORDER BY users.username""",
-                (assignment_id,),
+                query,
+                params,
             )]
 
     def list_items(self, collection, owner_id=None):

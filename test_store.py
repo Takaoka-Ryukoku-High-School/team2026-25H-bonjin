@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -71,6 +72,65 @@ class StoreTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM assignment_submissions"
             ).fetchone()[0]
         self.assertEqual(remaining, 0)
+
+    def test_assignment_submission_statuses_only_include_target_recipients(self):
+        first_class = self.store.create_class("1年A組")
+        second_class = self.store.create_class("1年B組")
+        other_grade_class = self.store.create_class("2年A組")
+        first_student = self.store.create_student(
+            "student-a", "password-a", first_class
+        )
+        self.store.create_student("student-b", "password-b", second_class)
+        self.store.create_student("student-c", "password-c", other_grade_class)
+        assignment_id = self.store.add_item("assignments", {
+            "subject": "数学",
+            "target_type": "grade",
+            "target_grade": "1年生",
+        })
+
+        statuses = self.store.list_assignment_submission_statuses(assignment_id)
+        self.assertEqual(
+            [status["username"] for status in statuses],
+            ["student-a", "student-b"],
+        )
+
+        with self.store._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM items WHERE id = ?",
+                (assignment_id,),
+            ).fetchone()
+            payload = json.loads(row["payload"])
+            payload["target_type"] = "class"
+            payload["target_class_id"] = str(first_class)
+            connection.execute(
+                "UPDATE items SET payload = ? WHERE id = ?",
+                (json.dumps(payload), assignment_id),
+            )
+        statuses = self.store.list_assignment_submission_statuses(assignment_id)
+        self.assertEqual([status["username"] for status in statuses], ["student-a"])
+
+    def test_class_grade_is_inferred_and_added_to_older_databases(self):
+        class_id = self.store.create_class("1年A組")
+        self.assertEqual(
+            next(
+                class_info["grade"]
+                for class_info in self.store.list_classes()
+                if class_info["id"] == class_id
+            ),
+            "1年生",
+        )
+
+        old_database = Path(self.temp_dir.name) / "old-schema.sqlite3"
+        with sqlite3.connect(old_database) as connection:
+            connection.execute(
+                """CREATE TABLE classes (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+                )"""
+            )
+            connection.execute("INSERT INTO classes (name) VALUES ('2年B組')")
+        migrated_store = Store(old_database)
+        self.assertEqual(migrated_store.list_classes()[0]["grade"], "2年生")
 
     def test_weekday_timetable_can_be_updated_by_day_and_period(self):
         lesson = {"day": "月", "period": "1", "time": "09:00-10:30",

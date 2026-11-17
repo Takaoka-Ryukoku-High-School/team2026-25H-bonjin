@@ -1,3 +1,4 @@
+import base64
 import sqlite3
 import threading
 import time
@@ -15,6 +16,9 @@ INK = "#202C2A"
 MUTED = "#77807B"
 WHITE = "#FFFEFA"
 WEEKDAY_OPTIONS = ("月", "火", "水", "木", "金")
+MAX_ASSIGNMENT_IMAGES = 5
+MAX_ASSIGNMENT_IMAGE_SIZE = 5 * 1024 * 1024
+MAX_ASSIGNMENT_IMAGES_SIZE = 10 * 1024 * 1024
 PERIOD_TIMES = {
     "1": "09:00-09:50",
     "2": "10:00-10:50",
@@ -24,6 +28,41 @@ PERIOD_TIMES = {
     "6": "15:00-15:50",
     "7": "16:00-16:50",
 }
+
+
+def image_media_type(contents):
+    if contents.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if contents.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if contents[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if contents.startswith(b"RIFF") and contents[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def assignment_visible_to_user(assignment, user, classes):
+    if user["role"] != "student":
+        return True
+    target_type = assignment.get("target_type", "all")
+    if target_type == "all":
+        return True
+
+    student_class = next(
+        (
+            class_info for class_info in classes
+            if str(class_info["id"]) == str(user.get("class_id"))
+        ),
+        None,
+    )
+    if student_class is None:
+        return False
+    if target_type == "grade":
+        return student_class.get("grade") == assignment.get("target_grade")
+    if target_type == "class":
+        return str(student_class["id"]) == str(assignment.get("target_class_id"))
+    return False
 
 
 def text_field(label, hint, expand=True, width=None, password=False, on_submit=None):
@@ -45,18 +84,28 @@ def text_field(label, hint, expand=True, width=None, password=False, on_submit=N
 
 def main(page: ft.Page, require_login=False):
     store = Store()
+    assignment_image_picker = next(
+        (service for service in page.services if isinstance(service, ft.FilePicker)),
+        None,
+    )
+    if assignment_image_picker is None:
+        assignment_image_picker = ft.FilePicker()
+        page.services.append(assignment_image_picker)
+    dashboard_layout = [None]
     page.title = "今日の段取り | 学生ダッシュボード"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.bgcolor = PAPER
-    page.padding = 24
+    page.bgcolor = "#ECEFEC"
+    page.padding = 0
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.scroll = ft.ScrollMode.AUTO
     page.on_resize = lambda e: resize_page()
 
     def show_role_picker():
+        page._dashboard_auto_refresh_token = None
         page._dashboard_auto_refresh_active = False
         page._student_auto_refresh_active = False
         page._teacher_auto_refresh_active = False
+        dashboard_layout[0] = None
 
         def enter_role(role):
             try:
@@ -99,9 +148,11 @@ def main(page: ft.Page, require_login=False):
         page.update()
 
     def show_login(message=""):
+        page._dashboard_auto_refresh_token = None
         page._dashboard_auto_refresh_active = False
         page._student_auto_refresh_active = False
         page._teacher_auto_refresh_active = False
+        dashboard_layout[0] = None
 
         username = text_field("ユーザー名", "ユーザー名")
         password = text_field("パスワード", "パスワード", password=True)
@@ -142,6 +193,9 @@ def main(page: ft.Page, require_login=False):
         page.update()
 
     def show_dashboard(user):
+        auto_refresh_token = object()
+        page._dashboard_auto_refresh_token = auto_refresh_token
+        auto_refresh_started = [False]
         status = ft.Text(color=MUTED, size=12)
         selected_conversation = [None]
         selected_tab = [0]
@@ -351,7 +405,7 @@ def main(page: ft.Page, require_login=False):
                 assignment_subject = text_field("科目", "例: 数学")
                 assignment_content = ft.TextField(
                     label="提出内容",
-                    hint_text="課題の内容や提出するものを入力",
+                    hint_text="課題の内容や提出するものを入力（画像のみでも登録できます）",
                     multiline=True,
                     min_lines=2,
                     max_lines=4,
@@ -360,14 +414,149 @@ def main(page: ft.Page, require_login=False):
                 due = text_field("提出日", "YYYY-MM-DD")
                 destination = text_field("提出先", "例: 教室で先生に提出")
                 inputs = [assignment_subject, assignment_content, due, destination]
+                assignment_classes = store.list_classes()
+                target_scope = ft.Dropdown(
+                    label="配信先",
+                    options=[
+                        ft.dropdown.Option("all", "全生徒"),
+                        ft.dropdown.Option("grade", "学年"),
+                        ft.dropdown.Option("class", "クラス"),
+                    ],
+                    value="all",
+                    width=160,
+                    data="assignment-target-scope",
+                )
+                target_value = ft.Dropdown(
+                    label="学年・クラス",
+                    options=[],
+                    width=220,
+                    visible=False,
+                    data="assignment-target-value",
+                )
+
+                def update_assignment_target_options(e=None):
+                    if target_scope.value == "grade":
+                        grades = {
+                            class_info["grade"] for class_info in assignment_classes
+                            if class_info["grade"]
+                        }
+                        target_value.options = [
+                            ft.dropdown.Option(grade)
+                            for grade in TEST_GRADES if grade in grades
+                        ]
+                    elif target_scope.value == "class":
+                        target_value.options = [
+                            ft.dropdown.Option(str(class_info["id"]), class_info["name"])
+                            for class_info in assignment_classes
+                        ]
+                    else:
+                        target_value.options = []
+                    target_value.value = (
+                        target_value.options[0].key if target_value.options else None
+                    )
+                    target_value.visible = target_scope.value != "all"
+                    page.update()
+
+                target_scope.on_select = update_assignment_target_options
+                selected_images = []
+                image_previews = ft.Column(
+                    spacing=6,
+                    data="assignment-image-previews",
+                )
+
+                def render_image_previews():
+                    image_previews.controls = [
+                        ft.Row([
+                            ft.Image(
+                                src=image["contents"],
+                                width=72,
+                                height=56,
+                                fit=ft.BoxFit.CONTAIN,
+                                border_radius=6,
+                                semantics_label=image["name"],
+                            ),
+                            ft.Text(image["name"], size=12, color=INK, expand=True),
+                            ft.TextButton(
+                                "削除",
+                                on_click=lambda e, image_index=index: remove_image(image_index),
+                            ),
+                        ], spacing=8)
+                        for index, image in enumerate(selected_images)
+                    ]
+                    page.update()
+
+                def remove_image(index):
+                    selected_images.pop(index)
+                    render_image_previews()
+
+                async def pick_assignment_images(e):
+                    try:
+                        files = await assignment_image_picker.pick_files(
+                            dialog_title="課題に添付する画像を選択",
+                            file_type=ft.FilePickerFileType.CUSTOM,
+                            allowed_extensions=["png", "jpg", "jpeg", "gif", "webp"],
+                            allow_multiple=True,
+                            with_data=True,
+                        )
+                    except (OSError, ValueError) as error:
+                        fail(f"画像を選択できませんでした: {error}")
+                        return
+                    if not files:
+                        return
+                    if len(selected_images) + len(files) > MAX_ASSIGNMENT_IMAGES:
+                        fail(f"画像は課題ごとに{MAX_ASSIGNMENT_IMAGES}枚まで添付できます。")
+                        return
+
+                    new_images = []
+                    for file in files:
+                        contents = file.bytes
+                        if contents is None:
+                            fail(f"{file.name}の画像データを読み込めませんでした。")
+                            return
+                        if len(contents) > MAX_ASSIGNMENT_IMAGE_SIZE:
+                            fail(f"{file.name}は1枚あたり5MB以下にしてください。")
+                            return
+                        media_type = image_media_type(contents)
+                        if media_type is None:
+                            fail(f"{file.name}は対応していない画像形式です。")
+                            return
+                        new_images.append({
+                            "name": file.name,
+                            "media_type": media_type,
+                            "contents": contents,
+                        })
+
+                    total_size = sum(
+                        len(image["contents"])
+                        for image in [*selected_images, *new_images]
+                    )
+                    if total_size > MAX_ASSIGNMENT_IMAGES_SIZE:
+                        fail("画像の合計サイズは10MB以下にしてください。")
+                        return
+                    selected_images.extend(new_images)
+                    render_image_previews()
+                    fail(f"{len(new_images)}枚の画像を添付しました。")
+
+                image_picker_button = ft.TextButton(
+                    "画像を添付",
+                    icon=ft.Icons.ADD_PHOTO_ALTERNATE_OUTLINED,
+                    data="assignment-image-picker",
+                    on_click=pick_assignment_images,
+                )
 
                 def add(e):
                     subject_value = (assignment_subject.value or "").strip()
                     content_value = (assignment_content.value or "").strip()
                     due_value = (due.value or "").strip()
                     destination_value = (destination.value or "").strip()
-                    if not subject_value or not content_value or not due_value or not destination_value:
-                        fail("科目・提出内容・提出日・提出先を入力してください。")
+                    if (
+                        not subject_value or not due_value or not destination_value
+                        or (not content_value and not selected_images)
+                    ):
+                        fail("科目・提出日・提出先と、提出内容または画像を入力してください。")
+                        return
+                    if target_scope.value != "all" and not target_value.value:
+                        fail("配信する学年またはクラスを選択してください。")
                         return
                     try:
                         due_value = datetime.strptime(
@@ -381,6 +570,23 @@ def main(page: ft.Page, require_login=False):
                         "content": content_value,
                         "due": due_value,
                         "destination": destination_value,
+                        "target_type": target_scope.value,
+                        "target_grade": (
+                            target_value.value if target_scope.value == "grade" else None
+                        ),
+                        "target_class_id": (
+                            target_value.value if target_scope.value == "class" else None
+                        ),
+                        "attachments": [
+                            {
+                                "name": image["name"],
+                                "media_type": image["media_type"],
+                                "data": base64.b64encode(
+                                    image["contents"]
+                                ).decode("ascii"),
+                            }
+                            for image in selected_images
+                        ],
                     }, "課題を登録しました")
             else:
                 date = text_field("日付", "YYYY-MM-DD")
@@ -407,7 +613,42 @@ def main(page: ft.Page, require_login=False):
                         "通知を更新" if collection == "reminders" and editing_reminder[0]
                         else "登録する"
                     )
-                    fields = [form(inputs, button_text, add)]
+                    if collection == "assignments":
+                        fields = [
+                            form(inputs, button_text, add),
+                            ft.Container(
+                                content=ft.Row([
+                                    target_scope,
+                                    target_value,
+                                    ft.Text(
+                                        "登録すると選択した生徒の画面に配信されます。",
+                                        size=11,
+                                        color=MUTED,
+                                    ),
+                                ], wrap=True, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                                padding=10,
+                                bgcolor="#F4F6F4",
+                                border_radius=8,
+                            ),
+                            ft.Container(
+                                content=ft.Column([
+                                    ft.Row([
+                                        image_picker_button,
+                                        ft.Text(
+                                            "PNG・JPEG・GIF・WebP（最大5枚、合計10MB）",
+                                            size=11,
+                                            color=MUTED,
+                                        ),
+                                    ], spacing=8, wrap=True),
+                                    image_previews,
+                                ], spacing=6),
+                                padding=10,
+                                bgcolor="#F4F6F4",
+                                border_radius=8,
+                            ),
+                        ]
+                    else:
+                        fields = [form(inputs, button_text, add)]
                     if collection == "reminders" and editing_reminder[0]:
                         fields.append(ft.TextButton(
                             "編集をキャンセル",
@@ -416,6 +657,14 @@ def main(page: ft.Page, require_login=False):
             else:
                 fields = []
             items = store.list_items(collection)
+            assignment_classes = []
+            if collection == "assignments":
+                assignment_classes = store.list_classes()
+                if user["role"] == "student":
+                    items = [
+                        item for item in items
+                        if assignment_visible_to_user(item, user, assignment_classes)
+                    ]
             if collection in ("calendar", "tests"):
                 items.sort(key=lambda item: (
                     item.get("date", ""),
@@ -836,12 +1085,37 @@ def main(page: ft.Page, require_login=False):
                             size=13,
                             color=MUTED,
                         ),
-                        ft.Text(
-                            f"提出内容: {item.get('content') or '内容は未登録です。'}",
+                    ]
+                    content_text = item.get("content", "")
+                    attachments = item.get("attachments", [])
+                    if content_text:
+                        card_controls.append(ft.Text(
+                            f"提出内容: {content_text}",
                             size=13,
                             color=INK,
-                        ),
-                    ]
+                        ))
+                    elif not attachments:
+                        card_controls.append(ft.Text(
+                            "提出内容: 内容は未登録です。",
+                            size=13,
+                            color=INK,
+                        ))
+                    if attachments:
+                        card_controls.append(ft.Text("添付画像", size=12, color=MUTED))
+                        card_controls.append(ft.Row([
+                            ft.Image(
+                                src=(
+                                    f"data:{attachment['media_type']};base64,"
+                                    f"{attachment['data']}"
+                                ),
+                                width=220,
+                                height=160,
+                                fit=ft.BoxFit.CONTAIN,
+                                border_radius=8,
+                                semantics_label=attachment["name"],
+                            )
+                            for attachment in attachments
+                        ], spacing=8, wrap=True))
                     if user["role"] == "student":
                         submitted = store.assignment_submitted(assignment_id, user["id"])
                         card_controls.append(ft.Text(
@@ -850,6 +1124,26 @@ def main(page: ft.Page, require_login=False):
                             color=GREEN if submitted else MUTED,
                         ))
                     else:
+                        target_type = item.get("target_type", "all")
+                        if target_type == "grade":
+                            audience = item.get("target_grade", "学年未設定")
+                        elif target_type == "class":
+                            audience = next(
+                                (
+                                    class_info["name"]
+                                    for class_info in assignment_classes
+                                    if str(class_info["id"])
+                                    == str(item.get("target_class_id"))
+                                ),
+                                "クラス未設定",
+                            )
+                        else:
+                            audience = "全生徒"
+                        card_controls.append(ft.Text(
+                            f"配信先: {audience}",
+                            size=12,
+                            color=MUTED,
+                        ))
                         submission_rows = []
                         for submission in store.list_assignment_submission_statuses(assignment_id):
                             status_dropdown = ft.Dropdown(
@@ -1460,6 +1754,11 @@ def main(page: ft.Page, require_login=False):
 
         def class_management_view():
             class_name = text_field("クラス名", "例 1年A組")
+            class_grade = ft.Dropdown(
+                label="学年",
+                options=[ft.dropdown.Option(grade) for grade in TEST_GRADES],
+                width=150,
+            )
             student_name = text_field("生徒ユーザー名", "ユーザー名")
             student_password = text_field("初期パスワード", "生徒に安全な方法で共有",
                                           password=True)
@@ -1471,8 +1770,11 @@ def main(page: ft.Page, require_login=False):
             )
 
             def add_class(e):
+                if not class_grade.value:
+                    fail("学年を選択してください。")
+                    return
                 try:
-                    store.create_class(class_name.value or "")
+                    store.create_class(class_name.value or "", class_grade.value)
                 except ValueError as error:
                     fail(str(error))
                 except sqlite3.IntegrityError:
@@ -1513,11 +1815,15 @@ def main(page: ft.Page, require_login=False):
             ]
             return ft.Column([
                 panel("クラス管理", "クラスごとに作成されるグループチャットに先生と所属生徒が参加します。", [
-                    form([class_name], "クラスを作成", add_class),
+                    form([class_name, class_grade], "クラスを作成", add_class),
                     form([student_name, student_password, class_dropdown],
                          "生徒アカウントを作成", add_student),
                     ft.Column([
-                        ft.Text(f"クラス: {item['name']}", color=INK) for item in classes
+                        ft.Text(
+                            f"クラス: {item['name']}（{item['grade'] or '学年未設定'}）",
+                            color=INK,
+                        )
+                        for item in classes
                     ] or [ft.Text("クラスはまだありません。", color=MUTED, size=13)], spacing=4),
                 ]),
                 panel("生徒アカウント", "生徒はここで作成したアカウントでログインします。", [
@@ -1535,13 +1841,30 @@ def main(page: ft.Page, require_login=False):
                     break
             else:
                 selected_conversation[0] = contacts[0]["conversation_id"]
-            conversation = ft.Dropdown(
-                label="チャット",
-                options=[ft.dropdown.Option(contact["conversation_id"], contact["label"])
-                         for contact in contacts],
-                value=selected_conversation[0],
-                on_select=lambda e: select_conversation(e.control.value),
+            selected_contact = next(
+                contact for contact in contacts
+                if contact["conversation_id"] == selected_conversation[0]
             )
+            conversation_header = ft.Row([
+                ft.Container(
+                    content=ft.Icon(
+                        ft.Icons.GROUP_OUTLINED
+                        if selected_contact["conversation_id"].startswith("class:")
+                        else ft.Icons.PERSON_OUTLINE,
+                        color=GREEN,
+                    ),
+                    width=42,
+                    height=42,
+                    alignment=ft.Alignment(0.5, 0.5),
+                    bgcolor=GREEN_LIGHT,
+                    border_radius=21,
+                ),
+                ft.Column([
+                    ft.Text(selected_contact["label"], size=17, color=INK,
+                            weight=ft.FontWeight.W_600),
+                    ft.Text("チャット", size=11, color=MUTED),
+                ], spacing=2),
+            ], spacing=10)
             message = ft.TextField(
                 label="メッセージ",
                 hint_text="メッセージを入力",
@@ -1626,13 +1949,6 @@ def main(page: ft.Page, require_login=False):
                 on_click=lambda e: None,
             )
 
-            def select_conversation(value):
-                if value and store.can_access_conversation(user, value):
-                    selected_conversation[0] = value
-                    send_button.text = send_button_label(value)
-                    message_list.controls = messages_view()
-                    page.update()
-
             def send(e):
                 try:
                     store.send_message(user, selected_conversation[0], message.value or "")
@@ -1652,7 +1968,15 @@ def main(page: ft.Page, require_login=False):
             message.on_submit = send
 
             return panel("チャット", "相手を選び、メッセージを入力して送信します。", [
-                conversation,
+                conversation_header,
+                ft.Container(
+                    content=message_list,
+                    height=420,
+                    padding=12,
+                    bgcolor="#F3F4F0",
+                    border_radius=12,
+                    border=ft.Border.all(1, "#E2E7E0"),
+                ),
                 ft.Container(
                     content=ft.Row([
                         message,
@@ -1666,30 +1990,35 @@ def main(page: ft.Page, require_login=False):
                     bgcolor=GREEN_LIGHT,
                     border_radius=18,
                 ),
-                ft.Container(
-                    content=message_list,
-                    height=420,
-                    padding=12,
-                    bgcolor="#F3F4F0",
-                    border_radius=18,
-                    border=ft.Border.all(1, "#E2E7E0"),
-                ),
             ])
 
         def render_all(message=None):
             teacher = user["role"] == "teacher"
             page._student_auto_refresh_active = not teacher
             page._teacher_auto_refresh_active = teacher
-            if not getattr(page, "_dashboard_auto_refresh_active", False):
+            if not auto_refresh_started[0]:
+                auto_refresh_started[0] = True
                 page._dashboard_auto_refresh_active = True
 
                 def auto_refresh_dashboard():
-                    while getattr(page, "_dashboard_auto_refresh_active", False):
+                    while (
+                        getattr(page, "_dashboard_auto_refresh_token", None)
+                        is auto_refresh_token
+                    ):
                         time.sleep(15)
+                        if (
+                            getattr(page, "_dashboard_auto_refresh_token", None)
+                            is not auto_refresh_token
+                        ):
+                            break
                         if not page.controls:
                             continue
                         try:
-                            page.run_thread(lambda: render_all())
+                            page.run_thread(
+                                lambda: render_all()
+                                if getattr(page, "_dashboard_auto_refresh_token", None)
+                                is auto_refresh_token else None
+                            )
                         except Exception:
                             pass
 
@@ -1705,40 +2034,161 @@ def main(page: ft.Page, require_login=False):
             else:
                 tab_labels.insert(1, "自分のタスク")
                 views.insert(1, tasks_view())
-            tab_views = ft.TabBarView(
-                [ft.Column([view], scroll=ft.ScrollMode.AUTO) for view in views],
-                expand=True,
+            selected_index = min(selected_tab[0], len(tab_labels) - 1)
+
+            def open_view(index):
+                selected_tab[0] = index
+                render_all()
+
+            icon_by_label = {
+                "ホーム": ft.Icons.HOME_OUTLINED,
+                "時間割": ft.Icons.SCHEDULE_OUTLINED,
+                "通知": ft.Icons.NOTIFICATIONS_OUTLINED,
+                "テスト": ft.Icons.ASSIGNMENT_OUTLINED,
+                "課題": ft.Icons.TASK_ALT,
+                "カレンダー": ft.Icons.EVENT_OUTLINED,
+                "チャット": ft.Icons.CHAT_OUTLINED,
+                "クラス管理": ft.Icons.GROUP_OUTLINED,
+                "自分のタスク": ft.Icons.TASK_ALT,
+            }
+            nav_texts = []
+            nav_items = []
+            for index, label in enumerate(tab_labels):
+                nav_text = ft.Text(
+                    label, size=13,
+                    color=GREEN if index == selected_index else INK,
+                    weight=ft.FontWeight.W_600 if index == selected_index else None,
+                    no_wrap=True,
+                )
+                nav_texts.append(nav_text)
+                nav_items.append(ft.Container(
+                    content=ft.Row([
+                        ft.Icon(
+                            icon_by_label[label],
+                            size=19,
+                            color=GREEN if index == selected_index else MUTED,
+                        ),
+                        nav_text,
+                    ], spacing=12),
+                    padding=ft.Padding.symmetric(horizontal=12, vertical=10),
+                    bgcolor="#E1EAE4" if index == selected_index else None,
+                    border_radius=8,
+                    ink=True,
+                    tooltip=label,
+                    data=f"dashboard-nav:{label}",
+                    on_click=lambda e, view_index=index: open_view(view_index),
+                ))
+
+            contacts = store.list_contacts(user)
+            chat_index = tab_labels.index("チャット")
+            contact_items = []
+            for contact in contacts:
+                is_selected_contact = (
+                    contact["conversation_id"] == selected_conversation[0]
+                )
+                is_group = contact["conversation_id"].startswith("class:")
+                contact_items.append(ft.Container(
+                    content=ft.Row([
+                        ft.Icon(
+                            ft.Icons.GROUP_OUTLINED if is_group else ft.Icons.PERSON_OUTLINE,
+                            size=17,
+                            color=GREEN if is_selected_contact else MUTED,
+                        ),
+                        ft.Text(
+                            contact["label"],
+                            size=12,
+                            color=GREEN if is_selected_contact else INK,
+                            weight=ft.FontWeight.W_600 if is_selected_contact else None,
+                            no_wrap=True,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                        ),
+                    ], spacing=9),
+                    padding=ft.Padding.symmetric(horizontal=12, vertical=9),
+                    bgcolor="#E1EAE4" if is_selected_contact else None,
+                    border_radius=8,
+                    ink=True,
+                    tooltip=contact["label"],
+                    data=f"dashboard-contact:{contact['conversation_id']}",
+                    on_click=lambda e, conversation_id=contact["conversation_id"]: (
+                        selected_conversation.__setitem__(0, conversation_id),
+                        open_view(chat_index),
+                    ),
+                ))
+            chat_heading = ft.Text(
+                "チャット", size=11, color=MUTED, weight=ft.FontWeight.W_600
             )
-            tabs = ft.Tabs(
+            nav_heading = ft.Text(
+                "ナビゲーション", size=11, color=MUTED,
+                weight=ft.FontWeight.W_600,
+            )
+            chat_empty = ft.Text("会話はありません", size=11, color=MUTED)
+            sidebar = ft.Container(
                 content=ft.Column([
-                    ft.TabBar(tabs=[ft.Tab(label=label) for label in tab_labels]),
-                    tab_views,
-                ], expand=True),
-                length=len(tab_labels),
-                selected_index=min(selected_tab[0], len(tab_labels) - 1),
-                animation_duration=200,
-                on_change=lambda e: selected_tab.__setitem__(0, e.control.selected_index),
-                expand=True,
+                    nav_heading,
+                    *nav_items,
+                    ft.Divider(height=12, color="#D8DEDA"),
+                    chat_heading,
+                    *(contact_items or [chat_empty]),
+                ], spacing=4, scroll=ft.ScrollMode.AUTO, expand=True),
+                width=240,
+                padding=ft.Padding.only(left=12, right=12, top=18, bottom=12),
+                bgcolor="#F4F6F4",
+                border=ft.Border.only(right=ft.BorderSide(1, "#DDE2DE")),
+                data="dashboard-sidebar",
             )
-            header = ft.Row([
-                ft.Text("DAILY NOTE", size=12, color=GREEN, weight=ft.FontWeight.BOLD),
-                ft.Row([
-                    ft.Text(f"{user['username']}（{'先生' if teacher else '生徒'}）",
-                            size=12, color=MUTED),
-                    ft.TextButton("ログアウト", on_click=lambda e: (
-                        show_login() if require_login else show_role_picker()
-                    )),
-                ], spacing=4),
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+            sidebar_detail_controls = [
+                nav_heading, chat_heading, *contact_items, chat_empty,
+            ]
+
+            header = ft.Container(
+                content=ft.Row([
+                    ft.Row([
+                        ft.Container(
+                            content=ft.Icon(ft.Icons.SCHOOL_OUTLINED, color="white", size=19),
+                            width=34,
+                            height=34,
+                            alignment=ft.Alignment(0.5, 0.5),
+                            bgcolor=GREEN,
+                            border_radius=8,
+                        ),
+                        ft.Text(
+                            "今日の段取り", size=16, color=INK,
+                            weight=ft.FontWeight.W_600,
+                        ),
+                    ], spacing=10),
+                    ft.Row([
+                        ft.Text(
+                            f"{user['username']}（{'先生' if teacher else '生徒'}）",
+                            size=12, color=MUTED,
+                        ),
+                        ft.TextButton(
+                            "ログアウト",
+                            data="dashboard-logout",
+                            on_click=lambda e: (
+                                show_login() if require_login else show_role_picker()
+                            ),
+                        ),
+                    ], spacing=8),
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                padding=ft.Padding.symmetric(horizontal=20, vertical=10),
+                bgcolor=WHITE,
+                border=ft.Border.only(bottom=ft.BorderSide(1, "#DDE2DE")),
+            )
             heading_controls = [
-                ft.Text("学生ダッシュボード", size=34, color=INK, weight=ft.FontWeight.W_600),
-                ft.Text("予定・締切・共有を、ひとつの場所で。", size=13, color=MUTED),
+                ft.Text(
+                    tab_labels[selected_index], size=26, color=INK,
+                    weight=ft.FontWeight.W_600,
+                ),
+                ft.Text("予定・締切・共有を、ひとつの場所に。", size=13, color=MUTED),
             ]
             if user["role"] == "student":
                 tomorrow = (datetime.now().date() + timedelta(days=1)).isoformat()
                 due_notices = []
+                student_classes = store.list_classes()
                 for assignment in store.list_items("assignments"):
                     if (
+                        assignment_visible_to_user(assignment, user, student_classes)
+                        and
                         assignment.get("due") == tomorrow
                         and not store.assignment_submitted(assignment["id"], user["id"])
                     ):
@@ -1764,29 +2214,62 @@ def main(page: ft.Page, require_login=False):
                         bgcolor="#FFF1E8",
                         border=ft.Border.all(1, "#F1C7B8"),
                         border_radius=6,
+                        data="dashboard-due-notices",
                     ))
             heading = ft.Column(heading_controls, spacing=4)
-            content = ft.Column([header, heading, tabs, status], width=700, spacing=22)
+            active_view = ft.Container(
+                content=ft.Column(
+                    [views[selected_index]],
+                    scroll=ft.ScrollMode.AUTO,
+                    expand=True,
+                ),
+                data="dashboard-active-view",
+                expand=True,
+            )
+            workspace = ft.Column([
+                heading,
+                active_view,
+                status,
+            ], spacing=16, expand=True)
+            body = ft.Row([
+                sidebar,
+                ft.Container(
+                    content=workspace,
+                    padding=24,
+                    expand=True,
+                    bgcolor="#ECEFEC",
+                ),
+            ], spacing=0, expand=True)
+            content = ft.Column([header, body], spacing=0, expand=True)
             page.controls.clear()
             page.add(ft.Container(
                 content=content,
-                width=700,
-                padding=ft.Padding.only(top=18, bottom=32),
+                expand=True,
+                bgcolor="#ECEFEC",
             ))
             if message:
                 status.value = message
+            dashboard_layout[0] = (sidebar, nav_texts, sidebar_detail_controls)
             resize_page()
             page.update()
 
         render_all()
 
     def resize_page():
-        page.padding = 12 if (page.width or 748) < 520 else 24
+        page.padding = 0
         if page.controls:
             container = page.controls[0]
             if isinstance(container, ft.Container) and isinstance(container.content, ft.Column):
-                container.width = min(700, max(272, (page.width or 748) - page.padding * 2))
+                container.width = min(1600, max(320, page.width or 1200))
                 container.content.width = container.width
+        if dashboard_layout[0]:
+            sidebar, nav_texts, detail_controls = dashboard_layout[0]
+            compact = (page.width or 1200) < 760
+            sidebar.width = 64 if compact else 240
+            for label in nav_texts:
+                label.visible = not compact
+            for control in detail_controls:
+                control.visible = not compact
 
     if require_login:
         show_login()
