@@ -13,6 +13,7 @@ from pathlib import Path
 DATABASE_FILE = Path.home() / ".daily_note.sqlite3"
 LEGACY_FILE = Path.home() / ".daily_note_tasks.json"
 PUBLIC_COLLECTIONS = ("timetable", "reminders", "tests", "assignments", "calendar")
+PRIVATE_COLLECTIONS = ("tasks", "notes")
 WEEKDAYS = ("月", "火", "水", "木", "金")
 TIMETABLE_DELIVERY_DAYS = {
     2: ("火",),
@@ -315,10 +316,10 @@ class Store:
             )]
 
     def list_items(self, collection, owner_id=None):
-        if collection not in PUBLIC_COLLECTIONS and collection != "tasks":
+        if collection not in PUBLIC_COLLECTIONS and collection not in PRIVATE_COLLECTIONS:
             raise ValueError("無効なデータ種別です。")
         with self._connect() as connection:
-            if collection == "tasks":
+            if collection in PRIVATE_COLLECTIONS:
                 rows = connection.execute(
                     "SELECT id, payload FROM items WHERE collection = ? AND owner_id = ? ORDER BY id DESC",
                     (collection, owner_id),
@@ -336,11 +337,11 @@ class Store:
             return result
 
     def add_item(self, collection, payload, owner_id=None):
-        if collection not in PUBLIC_COLLECTIONS and collection != "tasks":
+        if collection not in PUBLIC_COLLECTIONS and collection not in PRIVATE_COLLECTIONS:
             raise ValueError("無効なデータ種別です。")
-        if collection == "tasks" and owner_id is None:
-            raise ValueError("タスクには所有者が必要です。")
-        if collection != "tasks" and owner_id is not None:
+        if collection in PRIVATE_COLLECTIONS and owner_id is None:
+            raise ValueError("個人情報には所有者が必要です。")
+        if collection not in PRIVATE_COLLECTIONS and owner_id is not None:
             raise ValueError("共有情報に所有者は設定できません。")
         payload = dict(payload)
         if collection == "tests":
@@ -495,7 +496,7 @@ class Store:
             }
 
     def delete_item(self, collection, item_id, owner_id=None):
-        if collection == "tasks":
+        if collection in PRIVATE_COLLECTIONS:
             with self._connect() as connection:
                 connection.execute(
                     "DELETE FROM items WHERE id = ? AND collection = ? AND owner_id = ?",
@@ -509,7 +510,7 @@ class Store:
                 )
 
     def update_item(self, collection, item_id, payload, owner_id=None):
-        if collection == "tasks":
+        if collection in PRIVATE_COLLECTIONS:
             with self._connect() as connection:
                 connection.execute(
                     "UPDATE items SET payload = ? WHERE id = ? AND collection = ? AND owner_id = ?",
@@ -610,7 +611,9 @@ class Store:
                 )
             ]
 
-    def save_timetable_exception(self, exception_date, kind, title, lesson=None):
+    def save_timetable_exception(
+        self, exception_date, kind, title, lesson=None, notice=None, attachments=None
+    ):
         try:
             datetime.strptime(exception_date, "%Y-%m-%d")
         except ValueError as error:
@@ -628,6 +631,11 @@ class Store:
             ).fetchone()
             payload = json.loads(existing["payload"]) if existing else {}
             lessons = payload.get("lessons", []) if payload.get("kind") == kind else []
+            notice = payload.get("notice", "") if notice is None else notice.strip()
+            attachments = (
+                payload.get("attachments", [])
+                if attachments is None else attachments
+            )
             if kind == "holiday":
                 lessons = []
             elif lesson is not None:
@@ -650,7 +658,13 @@ class Store:
                     not item["period"].isdigit(),
                     int(item["period"]) if item["period"].isdigit() else item["period"],
                 ))
-            payload = {"kind": kind, "title": title, "lessons": lessons}
+            payload = {
+                "kind": kind,
+                "title": title,
+                "lessons": lessons,
+                "notice": notice,
+                "attachments": attachments,
+            }
             connection.execute(
                 """INSERT INTO timetable_exceptions (date, payload) VALUES (?, ?)
                    ON CONFLICT(date) DO UPDATE SET payload = excluded.payload""",

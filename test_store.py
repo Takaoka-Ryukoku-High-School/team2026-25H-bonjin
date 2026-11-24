@@ -45,6 +45,28 @@ class StoreTests(unittest.TestCase):
                          ["second task"])
         self.assertEqual(len(self.store.list_items("timetable")), 1)
 
+    def test_notes_are_private_and_updates_are_owner_scoped(self):
+        class_id = self.store.create_class("1年A組")
+        first_id = self.store.create_student("student-a", "password-a", class_id)
+        second_id = self.store.create_student("student-b", "password-b", class_id)
+        note_id = self.store.add_item(
+            "notes", {"text": "first note", "strokes": []}, first_id
+        )
+
+        self.assertEqual(
+            self.store.list_items("notes", first_id)[0]["text"],
+            "first note",
+        )
+        self.assertEqual(self.store.list_items("notes", second_id), [])
+        self.store.update_item(
+            "notes", note_id, {"text": "changed by another student"}, second_id
+        )
+        self.store.delete_item("notes", note_id, second_id)
+        self.assertEqual(
+            self.store.list_items("notes", first_id)[0]["text"],
+            "first note",
+        )
+
     def test_assignment_submission_status_is_tracked_per_student(self):
         class_id = self.store.create_class("1年A組")
         first_id = self.store.create_student("student-a", "password-a", class_id)
@@ -279,7 +301,18 @@ class StoreTests(unittest.TestCase):
             "day": "月", "period": "1", "time": "09:00-10:30",
             "subject": "通常授業", "teacher": "通常の先生",
         })
-        self.store.save_timetable_exception("2026-10-26", "schedule", "短縮授業")
+        attachments = [{
+            "name": "flyer.png",
+            "media_type": "image/png",
+            "data": "cG5n",
+        }]
+        self.store.save_timetable_exception(
+            "2026-10-26",
+            "schedule",
+            "短縮授業",
+            notice="集合場所は体育館です。",
+            attachments=attachments,
+        )
         self.store.save_timetable_exception("2026-10-26", "schedule", "短縮授業", {
             "period": "1", "time": "09:00-09:35", "subject": "数学", "teacher": "山田先生",
         })
@@ -295,12 +328,16 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([lesson["period"] for lesson in exceptions[0]["lessons"]], ["1", "2"])
         self.assertEqual(exceptions[0]["lessons"][0]["subject"], "国語")
         self.assertEqual(exceptions[0]["lessons"][0]["teacher"], "鈴木先生")
+        self.assertEqual(exceptions[0]["notice"], "集合場所は体育館です。")
+        self.assertEqual(exceptions[0]["attachments"], attachments)
 
         self.store.save_timetable_exception("2026-10-26", "holiday", "文化祭")
         holiday = self.store.list_timetable_exceptions()[0]
         self.assertEqual(holiday["kind"], "holiday")
         self.assertEqual(holiday["title"], "文化祭")
         self.assertEqual(holiday["lessons"], [])
+        self.assertEqual(holiday["notice"], "集合場所は体育館です。")
+        self.assertEqual(holiday["attachments"], attachments)
         self.store.delete_timetable_exception("2026-10-26")
         self.assertEqual(self.store.list_timetable_exceptions(), [])
 

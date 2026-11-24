@@ -116,6 +116,170 @@ class DashboardTests(unittest.TestCase):
                 self.assertIn(visible, labels)
                 self.assertNotIn(hidden, labels)
 
+    def test_student_can_write_and_draw_a_private_note(self):
+        page = FakePage()
+        dashboard.main(page)
+        picker_controls = page.controls[0].content.controls
+        picker_controls[3].controls[1].on_click(None)
+        task_view = open_dashboard_view(page, "自分のタスク")
+        self.assertEqual(
+            task_view.controls[0].controls[0].content.controls[0].value,
+            "メモ",
+        )
+        self.assertEqual(len(task_view.controls[0].controls), 1)
+
+        find_control_by_data(page.controls[0], "student-note-add").on_click(None)
+        memo = find_control_by_data(page.controls[0], "student-note-text:new")
+        canvas = find_control_by_data(page.controls[0], "student-note-canvas:new")
+        self.assertIsNotNone(memo)
+        self.assertIsNotNone(canvas)
+        memo.value = "数学の復習メモ"
+
+        drawing_stack = canvas.content
+        with patch.object(drawing_stack, "update"):
+            canvas.on_pan_start(SimpleNamespace(
+                local_position=SimpleNamespace(x=20, y=30)
+            ))
+            canvas.on_pan_update(SimpleNamespace(
+                local_position=SimpleNamespace(x=80, y=60)
+            ))
+            canvas.on_pan_end(None)
+
+        find_control_by_data(
+            page.controls[0], "student-note-save:new"
+        ).on_click(None)
+
+        student_id = self.store.get_development_user("student")["id"]
+        notes = self.store.list_items("notes", student_id)
+        self.assertEqual(notes[0]["text"], "数学の復習メモ")
+        self.assertGreater(len(notes[0]["strokes"][0]), 1)
+        self.assertEqual(
+            self.store.list_items("notes", self.store.get_development_user("teacher")["id"]),
+            [],
+        )
+
+        note_key = notes[0]["id"]
+        saved_memo = find_control_by_data(
+            page.controls[0], f"student-note-text:{note_key}"
+        )
+        self.assertEqual(saved_memo.value, "数学の復習メモ")
+        saved_canvas = find_control_by_data(
+            page.controls[0], f"student-note-canvas:{note_key}"
+        )
+        self.assertGreater(len(saved_canvas.content.controls), 1)
+
+        updated_memo = find_control_by_data(
+            page.controls[0], f"student-note-text:{note_key}"
+        )
+        updated_memo.value = "数学の復習メモ（更新）"
+        find_control_by_data(
+            page.controls[0], f"student-note-save:{note_key}"
+        ).on_click(None)
+        notes = self.store.list_items("notes", student_id)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["text"], "数学の復習メモ（更新）")
+
+        find_control_by_data(page.controls[0], "student-note-add").on_click(None)
+        new_memo = find_control_by_data(page.controls[0], "student-note-text:new")
+        new_memo.value = "英語の単語"
+        find_control_by_data(
+            page.controls[0], "student-note-save:new"
+        ).on_click(None)
+        notes = self.store.list_items("notes", student_id)
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[0]["text"], "英語の単語")
+
+        first_note_key = notes[0]["id"]
+        find_control_by_data(
+            page.controls[0], f"student-note-delete:{first_note_key}"
+        ).on_click(None)
+        remaining_notes = self.store.list_items("notes", student_id)
+        self.assertEqual(len(remaining_notes), 1)
+        self.assertEqual(remaining_notes[0]["text"], "数学の復習メモ（更新）")
+
+        find_control_by_data(page.controls[0], "student-note-add").on_click(None)
+        find_control_by_data(
+            page.controls[0], "student-note-delete:new"
+        ).on_click(None)
+        self.assertEqual(len(self.store.list_items("notes", student_id)), 1)
+        self.assertIsNone(
+            find_control_by_data(page.controls[0], "student-note-text:new")
+        )
+
+    def test_teacher_can_publish_a_date_specific_flyer_to_students(self):
+        image_bytes = b"\x89PNG\r\n\x1a\nflyer"
+        image_file = SimpleNamespace(
+            name="event.png",
+            size=len(image_bytes),
+            bytes=image_bytes,
+        )
+        teacher_page = FakePage()
+        dashboard.main(teacher_page)
+        picker_controls = teacher_page.controls[0].content.controls
+        picker_controls[3].controls[0].on_click(None)
+        open_dashboard_view(teacher_page, "時間割")
+
+        with patch.object(
+            dashboard.ft.FilePicker,
+            "pick_files",
+            new=AsyncMock(return_value=[image_file]),
+        ):
+            asyncio.run(find_control_by_data(
+                teacher_page.controls[0], "timetable-exception-image-picker"
+            ).on_click(None))
+
+        exception_date = find_control_by_data(
+            teacher_page.controls[0], "timetable-exception-date"
+        )
+        exception_kind = find_control_by_data(
+            teacher_page.controls[0], "timetable-exception-kind"
+        )
+        exception_title = find_control_by_data(
+            teacher_page.controls[0], "timetable-exception-title"
+        )
+        exception_notice = find_control_by_data(
+            teacher_page.controls[0], "timetable-exception-notice"
+        )
+        flyer_paper = find_control_by_data(
+            teacher_page.controls[0], "timetable-exception-flyer-paper"
+        )
+        self.assertIsNotNone(flyer_paper)
+        self.assertIsNotNone(find_control_by_data(
+            flyer_paper, "timetable-exception-image-picker"
+        ))
+        exception_date.value = "2026-11-25"
+        exception_kind.value = "holiday"
+        exception_title.value = "文化祭"
+        exception_notice.value = "集合場所は体育館です。"
+        find_control_by_data(
+            teacher_page.controls[0], "timetable-exception-save"
+        ).on_click(None)
+
+        saved_exception = self.store.list_timetable_exceptions()[0]
+        self.assertEqual(saved_exception["notice"], "集合場所は体育館です。")
+        self.assertEqual(saved_exception["attachments"][0]["name"], "event.png")
+
+        student_page = FakePage()
+        dashboard.main(student_page)
+        picker_controls = student_page.controls[0].content.controls
+        picker_controls[3].controls[1].on_click(None)
+        open_dashboard_view(student_page, "時間割")
+        flyer = find_control_by_data(
+            student_page.controls[0], "timetable-exception-flyer:2026-11-25"
+        )
+        self.assertIsNotNone(flyer)
+        flyer_controls = list(iter_controls(flyer))
+        self.assertTrue(any(
+            isinstance(control, dashboard.ft.Text)
+            and control.value == "集合場所は体育館です。"
+            for control in flyer_controls
+        ))
+        self.assertTrue(any(
+            isinstance(control, dashboard.ft.Image)
+            and control.src.startswith("data:image/png;base64,")
+            for control in flyer_controls
+        ))
+
     def test_login_mode_still_shows_login_form(self):
         page = FakePage()
         dashboard.main(page, require_login=True)
@@ -408,7 +572,7 @@ class DashboardTests(unittest.TestCase):
 
         self.assertTrue(getattr(page, "_student_auto_refresh_active", False))
 
-    def test_sidebar_opens_chat_and_compacts_on_narrow_pages(self):
+    def test_sidebar_opens_chat_and_stays_visible_on_narrow_pages(self):
         page = FakePage()
         dashboard.main(page)
         picker_controls = page.controls[0].content.controls
@@ -432,7 +596,11 @@ class DashboardTests(unittest.TestCase):
         page.width = 600
         page.on_resize(None)
         sidebar = find_control_by_data(page.controls[0], "dashboard-sidebar")
-        self.assertEqual(sidebar.width, 64)
+        self.assertEqual(sidebar.width, 200)
+        self.assertEqual(
+            page.horizontal_alignment,
+            dashboard.ft.CrossAxisAlignment.START,
+        )
 
     def test_old_dashboard_refresh_stops_after_switching_roles(self):
         page = FakePage()

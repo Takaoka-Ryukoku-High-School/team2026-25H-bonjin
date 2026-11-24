@@ -1,4 +1,5 @@
 import base64
+import math
 import sqlite3
 import threading
 import time
@@ -96,7 +97,8 @@ def main(page: ft.Page, require_login=False):
     page.theme_mode = ft.ThemeMode.LIGHT
     page.bgcolor = "#ECEFEC"
     page.padding = 0
-    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+    page.horizontal_alignment = ft.CrossAxisAlignment.START
+    page.vertical_alignment = ft.MainAxisAlignment.START
     page.scroll = ft.ScrollMode.AUTO
     page.on_resize = lambda e: resize_page()
 
@@ -203,6 +205,7 @@ def main(page: ft.Page, require_login=False):
         selected_timetable_day = ["月"]
         selected_test_grade = ["1年生"]
         selected_reminder_to_edit = [None]
+        new_note_pending = [False]
 
         def refresh(message=None):
             if message:
@@ -1206,27 +1209,215 @@ def main(page: ft.Page, require_login=False):
             return panel(title, role_description, fields)
 
         def tasks_view():
-            task = text_field("やること", "次にやることは？")
+            saved_notes = store.list_items("notes", user["id"])
+            canvas_width = max(280, min(640, (page.width or 1200) - 360))
+            canvas_height = 360
 
-            def add(e):
-                if task.value and task.value.strip():
-                    try:
-                        store.add_item("tasks", {"text": task.value.strip(), "done": False},
-                                       owner_id=user["id"])
-                    except (OSError, sqlite3.Error) as error:
-                        fail(f"保存できませんでした: {error}")
+            def note_editor(note, index):
+                note_key = note["id"] if note else "new"
+                note_strokes = [
+                    [
+                        [float(point[0]), float(point[1])]
+                        for point in stroke
+                        if (
+                            isinstance(point, (list, tuple))
+                            and len(point) == 2
+                            and isinstance(point[0], (int, float))
+                            and isinstance(point[1], (int, float))
+                        )
+                    ]
+                    for stroke in (note or {}).get("strokes", [])
+                    if isinstance(stroke, list)
+                ]
+                note_strokes = [stroke for stroke in note_strokes if stroke]
+                memo = ft.TextField(
+                    label="文字でメモ",
+                    value=(note or {}).get("text", ""),
+                    multiline=True,
+                    min_lines=5,
+                    max_lines=10,
+                    data=f"student-note-text:{note_key}",
+                )
+
+                def dot(point):
+                    return ft.Container(
+                        left=point[0] * canvas_width - 2.5,
+                        top=point[1] * canvas_height - 2.5,
+                        width=5,
+                        height=5,
+                        bgcolor=INK,
+                        border_radius=5,
+                    )
+
+                drawing_stack = ft.Stack(
+                    controls=[
+                        ft.Container(
+                            width=canvas_width,
+                            height=canvas_height,
+                            bgcolor=WHITE,
+                        ),
+                        *[
+                            dot(point)
+                            for stroke in note_strokes
+                            for point in stroke
+                        ],
+                    ],
+                )
+                active_stroke = [None]
+
+                def add_drawing_point(event, start=False):
+                    x = min(1.0, max(0.0, event.local_position.x / canvas_width))
+                    y = min(1.0, max(0.0, event.local_position.y / canvas_height))
+                    point = [x, y]
+                    if start:
+                        active_stroke[0] = []
+                        note_strokes.append(active_stroke[0])
+
+                    current = active_stroke[0]
+                    if current is None:
                         return
-                    render_all("タスクを追加しました")
+                    if current:
+                        previous = current[-1]
+                        distance = math.hypot(
+                            (point[0] - previous[0]) * canvas_width,
+                            (point[1] - previous[1]) * canvas_height,
+                        )
+                        steps = max(1, math.ceil(distance / 3))
+                        new_points = [
+                            [
+                                previous[0] + (point[0] - previous[0]) * step / steps,
+                                previous[1] + (point[1] - previous[1]) * step / steps,
+                            ]
+                            for step in range(1, steps + 1)
+                        ]
+                    else:
+                        new_points = [point]
+                    current.extend(new_points)
+                    drawing_stack.controls.extend(dot(item) for item in new_points)
+                    drawing_stack.update()
 
-            rows = [row("tasks", item, item["text"], editable=True)
-                    for item in store.list_items("tasks", user["id"])]
-            return panel(
-                "自分のタスク",
-                "このタスクは自分のアカウントだけに保存されます。",
-                [form([task], "追加する", add),
-                 ft.Column(rows or [ft.Text("まずは、やることをひとつ書いてみましょう。",
-                                             color=MUTED, size=13)], spacing=0)],
+                def clear_drawing(e):
+                    note_strokes.clear()
+                    active_stroke[0] = None
+                    del drawing_stack.controls[1:]
+                    drawing_stack.update()
+
+                def delete_note(e):
+                    try:
+                        if note:
+                            store.delete_item("notes", note["id"], user["id"])
+                        else:
+                            new_note_pending[0] = False
+                    except (OSError, sqlite3.Error) as error:
+                        fail(f"メモを削除できませんでした: {error}")
+                        return
+                    render_all("メモを削除しました")
+
+                def save_note(e):
+                    payload = {"text": memo.value or "", "strokes": note_strokes}
+                    try:
+                        if note:
+                            store.update_item(
+                                "notes", note["id"], payload, user["id"]
+                            )
+                        else:
+                            store.add_item("notes", payload, owner_id=user["id"])
+                    except (OSError, sqlite3.Error, ValueError) as error:
+                        fail(f"メモを保存できませんでした: {error}")
+                        return
+                    new_note_pending[0] = False
+                    render_all("メモを保存しました")
+
+                return ft.Container(
+                    content=ft.Column([
+                        ft.Text(f"メモ {index + 1}", size=14, color=INK),
+                        memo,
+                        ft.Text("ペンで書く・描く", size=14, color=INK),
+                        ft.Container(
+                            content=ft.GestureDetector(
+                                content=drawing_stack,
+                                width=canvas_width,
+                                height=canvas_height,
+                                on_pan_start=lambda e: add_drawing_point(e, start=True),
+                                on_pan_update=add_drawing_point,
+                                on_pan_end=lambda e: active_stroke.__setitem__(0, None),
+                                data=f"student-note-canvas:{note_key}",
+                            ),
+                            width=canvas_width,
+                            height=canvas_height,
+                            border=ft.Border.all(1, "#D8DEDA"),
+                            border_radius=6,
+                            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                        ),
+                        ft.Row([
+                            ft.OutlinedButton(
+                                "手書きを消去",
+                                icon=ft.Icons.DELETE_OUTLINE,
+                                on_click=clear_drawing,
+                                data=f"student-note-clear:{note_key}",
+                            ),
+                            ft.Button(
+                                "メモを保存",
+                                icon=ft.Icons.SAVE_OUTLINED,
+                                bgcolor=GREEN,
+                                color="white",
+                                on_click=save_note,
+                                data=f"student-note-save:{note_key}",
+                            ),
+                            ft.OutlinedButton(
+                                "メモを削除",
+                                icon=ft.Icons.DELETE_OUTLINE,
+                                on_click=delete_note,
+                                data=f"student-note-delete:{note_key}",
+                            ),
+                        ], spacing=8, wrap=True),
+                    ], spacing=8),
+                    padding=12,
+                    bgcolor=GREEN_LIGHT,
+                    border_radius=6,
+                )
+
+            notes_to_show = list(saved_notes)
+            if new_note_pending[0]:
+                notes_to_show.insert(0, None)
+            note_controls = [
+                note_editor(note, index)
+                for index, note in enumerate(notes_to_show)
+            ]
+
+            def add_note(e):
+                if not new_note_pending[0]:
+                    new_note_pending[0] = True
+                    render_all()
+
+            note_panel = panel(
+                "メモ",
+                "文字入力と手書きに対応しています。",
+                [
+                    ft.Button(
+                        "メモ欄を追加",
+                        icon=ft.Icons.ADD,
+                        bgcolor=GREEN,
+                        color="white",
+                        disabled=new_note_pending[0],
+                        on_click=add_note,
+                        data="student-note-add",
+                    ),
+                    *note_controls,
+                    *(
+                        []
+                        if note_controls
+                        else [
+                            ft.Text(
+                                "メモ欄を追加して、文字や手書きで記録できます。",
+                                color=MUTED,
+                                size=13,
+                            )
+                        ]
+                    ),
+                ],
             )
+            return ft.Column([note_panel], spacing=14)
 
         def home_view():
             today = datetime.now().date()
@@ -1621,12 +1812,133 @@ def main(page: ft.Page, require_login=False):
                     ],
                     value="schedule",
                     width=170,
+                    data="timetable-exception-kind",
                 )
                 exception_title = text_field("日課の内容・理由", "例 短縮授業、文化祭")
+                exception_date.data = "timetable-exception-date"
+                exception_title.data = "timetable-exception-title"
                 exception_period = text_field("時限", "例 1", expand=False, width=80)
                 exception_time = text_field("時間", "例 09:00-09:40")
                 exception_subject = text_field("授業内容・科目", "例 数学")
                 exception_teacher = text_field("担当教師", "例 山田先生")
+                exception_notice = ft.TextField(
+                    label="生徒へのお知らせ",
+                    hint_text="集合場所や持ち物などを入力",
+                    multiline=True,
+                    min_lines=3,
+                    max_lines=6,
+                    data="timetable-exception-notice",
+                )
+                selected_notice_images = []
+                notice_image_previews = ft.Column(
+                    spacing=6,
+                    data="timetable-exception-image-previews",
+                )
+
+                def render_notice_image_previews():
+                    notice_image_previews.controls = [
+                        ft.Row([
+                            ft.Image(
+                                src=image["contents"],
+                                width=72,
+                                height=56,
+                                fit=ft.BoxFit.CONTAIN,
+                                border_radius=6,
+                                semantics_label=image["name"],
+                            ),
+                            ft.Text(image["name"], size=12, color=INK, expand=True),
+                            ft.TextButton(
+                                "削除",
+                                on_click=lambda e, image_index=index: (
+                                    selected_notice_images.pop(image_index),
+                                    render_notice_image_previews(),
+                                ),
+                            ),
+                        ], spacing=8)
+                        for index, image in enumerate(selected_notice_images)
+                    ]
+                    page.update()
+
+                async def pick_exception_notice_images(e):
+                    try:
+                        files = await assignment_image_picker.pick_files(
+                            dialog_title="特別日のお知らせに添付する写真を選択",
+                            file_type=ft.FilePickerFileType.CUSTOM,
+                            allowed_extensions=["png", "jpg", "jpeg", "gif", "webp"],
+                            allow_multiple=True,
+                            with_data=True,
+                        )
+                    except (OSError, ValueError) as error:
+                        fail(f"写真を選択できませんでした: {error}")
+                        return
+                    if not files:
+                        return
+                    if len(selected_notice_images) + len(files) > MAX_ASSIGNMENT_IMAGES:
+                        fail(f"写真は1件のお知らせにつき{MAX_ASSIGNMENT_IMAGES}枚までです。")
+                        return
+
+                    new_images = []
+                    for file in files:
+                        contents = file.bytes
+                        if contents is None:
+                            fail(f"{file.name}の写真データを読み込めませんでした。")
+                            return
+                        if len(contents) > MAX_ASSIGNMENT_IMAGE_SIZE:
+                            fail(f"{file.name}は1枚あたり5MB以下にしてください。")
+                            return
+                        media_type = image_media_type(contents)
+                        if media_type is None:
+                            fail(f"{file.name}は対応していない画像形式です。")
+                            return
+                        new_images.append({
+                            "name": file.name,
+                            "media_type": media_type,
+                            "contents": contents,
+                        })
+                    total_size = sum(
+                        len(image["contents"])
+                        for image in [*selected_notice_images, *new_images]
+                    )
+                    if total_size > MAX_ASSIGNMENT_IMAGES_SIZE:
+                        fail("写真の合計サイズは10MB以下にしてください。")
+                        return
+                    selected_notice_images.extend(new_images)
+                    render_notice_image_previews()
+
+                exception_image_picker_button = ft.TextButton(
+                    "写真をアップロード",
+                    icon=ft.Icons.ADD_PHOTO_ALTERNATE_OUTLINED,
+                    data="timetable-exception-image-picker",
+                    on_click=pick_exception_notice_images,
+                )
+
+                def notice_attachments_for_date(selected_date):
+                    if not selected_notice_images:
+                        return None
+                    existing = next(
+                        (
+                            item for item in exceptions
+                            if item["date"] == selected_date
+                        ),
+                        {},
+                    )
+                    attachments = list(existing.get("attachments", []))
+                    attachments.extend({
+                        "name": image["name"],
+                        "media_type": image["media_type"],
+                        "data": base64.b64encode(image["contents"]).decode("ascii"),
+                    } for image in selected_notice_images)
+                    if len(attachments) > MAX_ASSIGNMENT_IMAGES:
+                        raise ValueError(
+                            f"写真は1件のお知らせにつき{MAX_ASSIGNMENT_IMAGES}枚までです。"
+                        )
+                    total_size = sum(
+                        len(base64.b64decode(image["data"]))
+                        for image in attachments
+                    )
+                    if total_size > MAX_ASSIGNMENT_IMAGES_SIZE:
+                        raise ValueError("写真の合計サイズは10MB以下にしてください。")
+                    return attachments
 
                 def set_exception_fields(e):
                     is_holiday = kind.value == "holiday"
@@ -1663,6 +1975,8 @@ def main(page: ft.Page, require_login=False):
                             kind.value,
                             exception_title.value or "",
                             lesson=lesson,
+                            notice=exception_notice.value or "",
+                            attachments=notice_attachments_for_date(selected_date),
                         )
                     except ValueError as error:
                         fail(str(error))
@@ -1678,6 +1992,10 @@ def main(page: ft.Page, require_login=False):
                             (exception_date.value or "").strip(),
                             kind.value,
                             exception_title.value or "",
+                            notice=exception_notice.value or "",
+                            attachments=notice_attachments_for_date(
+                                (exception_date.value or "").strip()
+                            ),
                         )
                     except ValueError as error:
                         fail(str(error))
@@ -1690,14 +2008,52 @@ def main(page: ft.Page, require_login=False):
                         if kind.value == "holiday" else "特別日を設定しました"
                     )
 
+                exception_date_form = form(
+                    [exception_date, kind, exception_title],
+                    "日付・日課設定を保存",
+                    save_exception_day,
+                )
+                exception_date_form.content.controls[-1].data = (
+                    "timetable-exception-save"
+                )
+                flyer_paper = ft.Container(
+                    content=ft.Column([
+                        ft.Text(
+                            "生徒向けお知らせちらし",
+                            size=16,
+                            color=INK,
+                            weight=ft.FontWeight.W_600,
+                        ),
+                        ft.Text(
+                            "お知らせ文を書き、写真や画像を添付できます。",
+                            size=12,
+                            color=MUTED,
+                        ),
+                        exception_notice,
+                        ft.Row([
+                            exception_image_picker_button,
+                            ft.Text(
+                                "画像は5枚まで、合計10MBまで",
+                                size=12,
+                                color=MUTED,
+                            ),
+                        ], wrap=True, spacing=8),
+                        notice_image_previews,
+                    ], spacing=10),
+                    padding=18,
+                    bgcolor=PAPER,
+                    border=ft.Border.all(1, "#D8D1BF"),
+                    border_radius=4,
+                    data="timetable-exception-flyer-paper",
+                )
                 controls.append(panel(
                     "日付指定の特別日課・休校",
-                    "特別日を登録すると、その日は通常時間割の代わりにこの日課を表示します。同じ日付・時限を再登録すると授業を更新し、別の時限を登録すると授業を追加します。",
+                    "特別日を登録すると通常時間割より優先されます。お知らせ文や写真も生徒に表示できます。",
                     [
-                        form([exception_date, kind, exception_title],
-                             "日付・日課設定を保存", save_exception_day),
+                        exception_date_form,
                         form([exception_period, exception_time, exception_subject,
                               exception_teacher], "授業を登録・更新", save_exception_lesson),
+                        flyer_paper,
                     ],
                 ))
 
@@ -1720,6 +2076,37 @@ def main(page: ft.Page, require_login=False):
                     detail,
                     editable=can_edit,
                 ))
+                flyer_controls = []
+                if exception.get("notice"):
+                    flyer_controls.append(ft.Text(
+                        exception["notice"],
+                        size=13,
+                        color=INK,
+                    ))
+                attachments = exception.get("attachments", [])
+                if attachments:
+                    flyer_controls.append(ft.Row([
+                        ft.Image(
+                            src=f"data:{image['media_type']};base64,{image['data']}",
+                            width=240,
+                            height=180,
+                            fit=ft.BoxFit.CONTAIN,
+                            border_radius=6,
+                            semantics_label=image["name"],
+                        )
+                        for image in attachments
+                    ], wrap=True, spacing=8))
+                if flyer_controls:
+                    exception_rows.append(ft.Container(
+                        content=ft.Column([
+                            ft.Text("お知らせ", size=12, color=MUTED),
+                            *flyer_controls,
+                        ], spacing=6),
+                        padding=12,
+                        bgcolor=GREEN_LIGHT,
+                        border_radius=6,
+                        data=f"timetable-exception-flyer:{exception['date']}",
+                    ))
             controls.append(panel("登録済みの特別日課・休校", "登録した日付は通常時間割より優先されます。", [
                 ft.Column(exception_rows or [
                     ft.Text("特別日課・休校はまだ登録されていません。", color=MUTED, size=13)
@@ -2260,16 +2647,16 @@ def main(page: ft.Page, require_login=False):
         if page.controls:
             container = page.controls[0]
             if isinstance(container, ft.Container) and isinstance(container.content, ft.Column):
-                container.width = min(1600, max(320, page.width or 1200))
+                container.width = max(320, page.width or 1200)
+                container.alignment = ft.Alignment(0, -1)
                 container.content.width = container.width
         if dashboard_layout[0]:
             sidebar, nav_texts, detail_controls = dashboard_layout[0]
-            compact = (page.width or 1200) < 760
-            sidebar.width = 64 if compact else 240
+            sidebar.width = max(160, round((page.width or 1200) / 3))
             for label in nav_texts:
-                label.visible = not compact
+                label.visible = True
             for control in detail_controls:
-                control.visible = not compact
+                control.visible = True
 
     if require_login:
         show_login()
